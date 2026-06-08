@@ -17,6 +17,7 @@ Responsibilities of this plugin:
 
 Only dependencies already present in the bundle are used: pyzmq, numpy, opencv, msgpack, pyglui.
 """
+import csv
 import logging
 import os
 import queue
@@ -39,6 +40,19 @@ except Exception:  # pragma: no cover - API guard
     PLData_Writer = None
 
 logger = logging.getLogger(__name__)
+
+# Flat CSV columns for the observed object (easy offline merge with LSL/XDF + RTMaps logs by ts).
+CSV_HEADER = ["frame_index", "timestamp", "gaze_x", "gaze_y", "observed_name", "observed_id",
+              "observed_conf", "obs_x1", "obs_y1", "obs_x2", "obs_y2", "n_objects"]
+
+
+def datum_csv_row(datum):
+    f = datum.get("focus") or {}
+    box = f.get("box") or ["", "", "", ""]
+    gaze = datum.get("gaze_2d") or ["", ""]
+    return [datum.get("frame_index"), datum.get("timestamp"), gaze[0], gaze[1],
+            f.get("name", ""), f.get("id", ""), f.get("conf", ""),
+            box[0], box[1], box[2], box[3], len(datum.get("objects", []))]
 
 # Colors are in BGR (OpenCV order).
 COLOR_OBSERVED = (12, 15, 145)    # red  (#9C210C) — object the participant is looking at
@@ -159,7 +173,8 @@ class Object_Recognition_YOLO(Plugin):
 
     def __init__(self, g_pool, server_address="tcp://127.0.0.1:5560", conf=0.25,
                  smooth=0.5, max_rate=30.0, sight_only=False, show_masks=True, show_ids=False,
-                 classes_filter="", detect_floor=0.10):
+                 classes_filter="", detect_floor=0.10,
+                 export_enabled=False, export_address="tcp://*:5561"):
         super().__init__(g_pool)
         self.order = 0.1  # run early so downstream plugins can use the "objects" events
 
@@ -175,6 +190,9 @@ class Object_Recognition_YOLO(Plugin):
         # comma-separated class names to DISPLAY; empty = show all. The detector still finds
         # everything (full data is recorded); this only filters what is drawn / eligible as focus.
         self.classes_filter = classes_filter
+        # Publish object data on a ZMQ PUB socket for external sinks (RTMaps subscriber, LSL relay).
+        self.export_enabled = export_enabled
+        self.export_address = export_address  # bind address; "tcp://*:5561" = all interfaces (LAN)
         self.activation_state = False     # detection on/off
 
         # runtime state
@@ -188,6 +206,10 @@ class Object_Recognition_YOLO(Plugin):
         self.gaze_position_2d = []
         self.client = None
         self._writer = None
+        self._csv = None                  # objects.csv file handle (recording)
+        self._csv_writer = None
+        self._pub = None                  # ZMQ PUB socket for data export
+        self._pub_ctx = None
         self._draw_fps = 0.0
         self._last_submit = 0.0
 
@@ -233,10 +255,25 @@ class Object_Recognition_YOLO(Plugin):
         self.menu.append(ui.Switch("show_ids", self, label="Show track ids"))
         self.menu.append(ui.Switch("sight_only", self, label="Only observed object"))
         self.menu.append(ui.Button("Reconnect detector", self.restart_client))
+
+        self.menu.append(ui.Separator())
+        self.menu.append(ui.Text_Input("export_address", self, label="Export bind address"))
+        self.menu.append(ui.Switch("export_enabled", self, label="Stream object data (RTMaps/LSL)",
+                                   setter=self._toggle_export))
+        self.menu.append(ui.Info_Text(
+            "Publishes the per-frame object datum on a ZMQ PUB socket (topic \"objects\") for "
+            "external sinks: RTMaps (rtmaps_stream.py) and the LSL relay (lsl_relay.py). Use "
+            "tcp://*:5561 to expose it on the LAN, or tcp://127.0.0.1:5561 for localhost only."
+        ))
+
+        self.menu.append(ui.Separator())
         self.menu.append(ui.Switch("activation_state", self, label="Launch object recognition",
                                    setter=self._toggle_activation))
         self.status_text = ui.Info_Text("Detector: idle")
         self.menu.append(self.status_text)
+
+        if self.export_enabled:  # restored from a previous session
+            self._open_pub()
 
     def deinit_ui(self):
         self.remove_menu()
@@ -249,6 +286,40 @@ class Object_Recognition_YOLO(Plugin):
             self.start_client()
         else:
             self.stop_client()
+
+    def _toggle_export(self, value):
+        self.export_enabled = value
+        if value:
+            self._open_pub()
+        else:
+            self._close_pub()
+
+    # --- data export (ZMQ PUB) ------------------------------------------------------------
+    def _open_pub(self):
+        self._close_pub()
+        try:
+            self._pub_ctx = zmq.Context()
+            self._pub = self._pub_ctx.socket(zmq.PUB)
+            self._pub.setsockopt(zmq.LINGER, 0)
+            self._pub.bind(self.export_address)
+            logger.info("object-data export bound to %s", self.export_address)
+        except Exception as exc:
+            logger.warning("could not bind export socket %s: %s", self.export_address, exc)
+            self._close_pub()
+
+    def _close_pub(self):
+        if self._pub is not None:
+            try:
+                self._pub.close(0)
+            except Exception:  # pragma: no cover
+                pass
+        if self._pub_ctx is not None:
+            try:
+                self._pub_ctx.term()
+            except Exception:  # pragma: no cover
+                pass
+        self._pub = None
+        self._pub_ctx = None
 
     # --- detector client lifecycle --------------------------------------------------------
     def start_client(self):
@@ -277,13 +348,21 @@ class Object_Recognition_YOLO(Plugin):
 
     def _open_writer(self, rec_path):
         self._close_writer()
-        if PLData_Writer is None or not rec_path:
+        if not rec_path:
             return
+        if PLData_Writer is not None:
+            try:
+                self._writer = PLData_Writer(rec_path, "objects")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Could not open PLData_Writer: %s", exc)
+                self._writer = None
         try:
-            self._writer = PLData_Writer(rec_path, "objects")
+            self._csv = open(os.path.join(rec_path, "objects.csv"), "w", newline="")
+            self._csv_writer = csv.writer(self._csv)
+            self._csv_writer.writerow(CSV_HEADER)
         except Exception as exc:  # pragma: no cover
-            logger.warning("Could not open PLData_Writer: %s", exc)
-            self._writer = None
+            logger.warning("Could not open objects.csv: %s", exc)
+            self._csv = self._csv_writer = None
 
     def _close_writer(self):
         if self._writer is not None:
@@ -292,6 +371,12 @@ class Object_Recognition_YOLO(Plugin):
             except Exception:  # pragma: no cover
                 pass
             self._writer = None
+        if self._csv is not None:
+            try:
+                self._csv.close()
+            except Exception:  # pragma: no cover
+                pass
+            self._csv = self._csv_writer = None
 
     # --- per-frame processing -------------------------------------------------------------
     def recent_events(self, events):
@@ -340,11 +425,17 @@ class Object_Recognition_YOLO(Plugin):
         if datum is not None:
             events["objects"].append(datum)
             self._publish(datum)
+            self._export(datum)
             if self._writer is not None:
                 try:
                     self._writer.append(datum)
                 except Exception as exc:  # pragma: no cover
                     logger.debug("PLData append failed: %s", exc)
+            if self._csv_writer is not None:
+                try:
+                    self._csv_writer.writerow(datum_csv_row(datum))
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("CSV write failed: %s", exc)
 
         dt = time.time() - t_prev
         if dt > 0:
@@ -459,6 +550,14 @@ class Object_Recognition_YOLO(Plugin):
         except Exception as exc:  # pragma: no cover - API guard
             logger.debug("ipc_pub.send failed: %s", exc)
 
+    def _export(self, datum):
+        if not self.export_enabled or self._pub is None:
+            return
+        try:
+            self._pub.send_multipart([b"objects", msgpack.packb(datum, use_bin_type=True)])
+        except Exception as exc:  # pragma: no cover
+            logger.debug("export send failed: %s", exc)
+
     def _update_status(self):
         if self.classes_text is not None:
             seen = sorted(self._seen_classes)
@@ -498,8 +597,11 @@ class Object_Recognition_YOLO(Plugin):
             "show_masks": self.show_masks,
             "show_ids": self.show_ids,
             "classes_filter": self.classes_filter,
+            "export_enabled": self.export_enabled,
+            "export_address": self.export_address,
         }
 
     def cleanup(self):
         self.stop_client()
         self._close_writer()
+        self._close_pub()

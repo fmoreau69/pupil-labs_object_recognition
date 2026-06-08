@@ -1,20 +1,204 @@
-# pupil-labs_object_recognition
-Real-Time Object Recognition plugin for pupil capture app
+# Pupil Labs — Object Recognition
 
-Plugin for Pupil Capture, it provides : 
-- detection of objects in the world video
-- recognition of which object you are looking at, based on gaze data and Yolo coordinates.
-- streaming of the video with objects detected on tcp, with compatibility with RTMaps (contact me for this)
-- exporting data of which objects are in focus in a custom topic named "objects" in the IPC Backbone
-- saving local .avi video and data of which objects are in focus in JSON
+Real-time **object detection & segmentation** plugin for [Pupil Core](https://docs.pupil-labs.com/core/)
+(Pupil Capture **and** Pupil Player), built for cognitive-science driving experiments: from the
+world camera of a participant wearing a Pupil Core headset, it identifies the objects in the scene
+and determines **what the participant is looking at** — not just *where* they look.
 
-The plugin uses already trained Yolo models, but it is easy to add a custom model that can recognize other things than objects like facial emotion or whatever you need to.
+> **2026 rewrite.** Darknet and imagezmq are gone. Detection now runs on
+> [Ultralytics YOLO](https://docs.ultralytics.com/) with optional tracking and segmentation, in a
+> separate process, so the plugin installs as a **single `.py` file** and stays real-time.
 
-For more information about Yolo and Pupil Capture, check out :
-- https://github.com/AlexeyAB/darknet
-- https://docs.pupil-labs.com/developer/
+---
 
-Contact us on discord : baptonx#2813 | Fab#6442 ; or by email : b.broyer@free.fr | fabien.moreau@univ-eiffel.fr
+## What it does
 
-Developped by Baptiste BROYER under the supervision of Fabien Moreau at Gustave Eiffel University Lyon-Bron campus
-© 2020
+- **Detects / segments** objects in the world view (YOLO, COCO classes by default).
+- **Tracks** objects across frames (stable ids) and **temporally smooths** boxes/masks so contours
+  don't flicker.
+- **Gaze ↔ object matching**: the object under the gaze is drawn in **red** (observed), the others
+  in **green** — using point-in-box *or* point-in-mask.
+- **Records** the object data natively into the Pupil recording (`objects.pldata` + `objects.csv`)
+  and publishes it on the Pupil IPC backbone (topic `objects`).
+- **Streams** the object data to **RTMaps** and **LSL** for multi-sensor synchronisation.
+- **Pupil Player** plugin to replay the overlay and to **reprocess raw recordings** offline
+  (re-run detection + gaze matching on sessions acquired without the plugin).
+- Optional extra engines: **YOLOPv2** (drivable area / lane lines) and **SAM3** (text-prompt
+  segmentation, offline).
+
+---
+
+## Architecture
+
+The Pupil Capture/Player bundle ships **Python 3.6**, which can't run PyTorch. So detection runs in
+a separate **Python 3.12** process; the in-bundle plugin is a thin client.
+
+```
+┌─ Pupil Capture / Player (bundle, Python 3.6) ─┐        ┌─ Detector (your venv, Python 3.12) ─┐
+│  detection_plugin.py / player_..._.py         │  ZMQ   │  yolo_server.py + engines.py        │
+│  • world frame + gaze                         │ ─────► │  • ultralytics YOLO (+track/smooth) │
+│  • overlay, gaze matching (red/green)         │ ◄───── │  • yolopv2 / sam3 (optional)        │
+│  • record objects.pldata + objects.csv        │        └─────────────────────────────────────┘
+│  • IPC "objects" + ZMQ PUB export             │
+└──────┬─────────────────────────────────────────┘
+       │ ZMQ PUB (object data)
+       ├──► RTMaps   (rtmaps_stream.py)
+       └──► LSL      (lsl_relay.py → LabRecorder)
+```
+
+---
+
+## Requirements
+
+- **Pupil Core** app bundle (Pupil Capture / Player) — installed from the official `.msi`/installer.
+- **Python 3.12** with an **NVIDIA GPU + CUDA** for real-time detection (CPU works but slower).
+- The detector deps install via pip (next section). The plugins need **no extra install** — they
+  use only what the bundle already ships (pyzmq, numpy, opencv, msgpack, pyglui).
+
+---
+
+## Installation
+
+### 1. Detector (once, Python 3.12 venv)
+
+Install the **CUDA** build of torch *first* (otherwise pip pulls the CPU build on Windows):
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements-detector.txt
+```
+
+Check the GPU is visible:
+```powershell
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+### 2. Plugins (just copy one file each)
+
+- **Capture** → copy `detection_plugin.py` into `~/pupil_capture_settings/plugins/`
+- **Player**  → copy `player_object_recognition.py` into `~/pupil_player_settings/plugins/`
+
+(`~` is your home folder, e.g. `C:\Users\<you>\`.)
+
+### 3. Optional — multi-sensor export
+
+- **RTMaps**: put `rtmaps_stream.py` in an RTMaps Python block.
+- **LSL**: in the detector venv, `pip install -r requirements-relay.txt` (adds `pylsl`).
+
+---
+
+## Usage
+
+### Start the detector
+
+```powershell
+python yolo_server.py                       # segmentation (yolo11n-seg), default
+python yolo_server.py --model yolo11n.pt    # detection only (lighter, e.g. weaker laptop)
+```
+Leave it running. The model file (~6 MB) downloads automatically on first launch.
+
+### Pupil Capture
+
+1. Start Pupil Capture, open **Plugin Manager**, enable **Object Recognition (YOLO)**.
+2. Toggle **Launch object recognition**. Boxes/masks appear; after calibration the looked-at object
+   turns red.
+
+**Controls**
+
+| Control | What it does |
+|---|---|
+| Detector address | Where the detector listens (default `tcp://127.0.0.1:5560`). |
+| Display confidence | Hides objects below this score **from the overlay & "observed" pick**. Detection still finds everything; all detections are recorded. |
+| Temporal smoothing | 0–0.95. Higher = steadier contours, slightly more lag. |
+| Max detection rate | Caps inference rate (Hz); the overlay holds between frames. Lower it to steady the view or save GPU. |
+| Classes to display | Comma-separated whitelist (e.g. `person, car, bus, traffic light`); empty = all. Display-only; everything is still recorded. |
+| Draw segmentation masks | Outline masks instead of boxes (with a seg model). |
+| Show track ids | Prefix labels with the track id (`#3`). `#-` means the detector returned no id → it's not tracking (restart `yolo_server.py` without `--no-track`). |
+| Only observed object | Draw/keep only the looked-at object. |
+| Stream object data (RTMaps/LSL) | Publish the per-frame object data on a ZMQ PUB socket (see Exports). |
+
+### Pupil Player
+
+Open a recording with **Object Recognition (YOLO) — Player** enabled:
+
+- **Replay**: if the recording already has `objects.pldata` (recorded live, or from a previous
+  reprocess), the overlay is redrawn automatically. Same display controls as Capture.
+- **Reprocess**: for raw recordings (world video + gaze, no object data), click **Reprocess
+  recording** (detector running). It runs detection + gaze matching over every frame and writes
+  `objects.pldata` + `objects.csv`. Use this to analyse eye-tracking data acquired *without* the
+  plugin, or to run heavy/offline engines (SAM3). ⚠️ overwrites any existing `objects.pldata`.
+
+### Exports (RTMaps / LSL)
+
+Enable **Stream object data (RTMaps/LSL)** in the Capture plugin (bind address `tcp://*:5561`
+exposes it on the LAN; `tcp://127.0.0.1:5561` is localhost only). Then:
+
+- **RTMaps**: set the `rtmaps_stream.py` block's `sub_address` to `tcp://<pupil-host>:5561`. Outputs:
+  observed name/id/box, gaze, object count, Pupil timestamp, full JSON.
+- **LSL**: `python lsl_relay.py --connect tcp://<pupil-host>:5561`. Creates two LSL outlets —
+  `PupilObjects` (numeric: `observed, x1, y1, x2, y2, gaze_x, gaze_y`) and `PupilObjects_json`
+  (full datum as a string marker) — recordable in LabRecorder.
+
+> **Offline note**: LSL/RTMaps are *live* sync transports. If you detect only in post-processing,
+> use `objects.pldata` / `objects.csv` and merge with your live LSL/XDF + RTMaps logs **by
+> timestamp** — don't stream offline (the replay clock ≠ session clock).
+
+---
+
+## Data outputs
+
+| Output | Where | Contents |
+|---|---|---|
+| `objects.pldata` | recording folder | Full per-frame data (Pupil-native, re-loadable in Player). |
+| `objects.csv` | recording folder | Flat per-frame row: frame, timestamp, gaze, observed name/id/box, object count. |
+| IPC topic `objects` | Pupil IPC backbone | Live, for other Pupil plugins / network clients. |
+| ZMQ PUB (`tcp://*:5561`) | network | `[b"objects", msgpack(datum)]` per frame → RTMaps / LSL relay. |
+
+Per-frame **datum**: `{topic, timestamp, frame_index, gaze_2d, focus:{id,name,conf,box,mask},
+objects:[{id,kind,engine,name,conf,box}]}`. `kind` is `object` (instance) or `layer` (semantic
+region like road/lane).
+
+---
+
+## Engines (advanced)
+
+Run several at once with `--engines` (merged into one overlay):
+
+```powershell
+python yolo_server.py --engines yolo,yolopv2 --yolopv2-model path\to\yolopv2.pt
+python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
+```
+
+| Engine | Output | Real-time | Needs |
+|---|---|:--:|---|
+| `yolo` | objects + masks, tracking | ✅ | ultralytics (installed) |
+| `yolopv2` | drivable-area + lane layers | ✅ | `yolopv2.pt` (TorchScript) |
+| `sam3` | text-prompt masks | ❌ (offline) | `sam3` pkg + gated HF `facebook/sam3` |
+
+SAM3 is offline-grade on Windows (its video predictor needs Linux/`triton`) — use it in Player.
+
+---
+
+## Troubleshooting
+
+- **"Detector: DISCONNECTED"** → start `python yolo_server.py`; check the **Detector address**.
+- **Track ids show `#-`** → the detector isn't tracking; restart it (tracking is on by default,
+  don't pass `--no-track`).
+- **Overlay too jittery** → raise **Temporal smoothing** (0.6–0.8) and/or lower **Max detection rate**.
+- **Raising confidence doesn't reduce boxes** → use **Display confidence** (it filters the overlay
+  deterministically; the server keeps detecting/recording everything).
+
+---
+
+## Roadmap & credits
+
+See [`ROADMAP.md`](ROADMAP.md) for architecture details and the remaining work (annotated-video
+streaming, live validation of YOLOPv2/SAM3).
+
+Originally developed in 2020 by **Baptiste Broyer** under the supervision of **Fabien Moreau** at
+**Université Gustave Eiffel** (LESCOT, Lyon-Bron). 2026 rewrite to Ultralytics + multi-process
+architecture.
+
+Contact: fabien.moreau@univ-eiffel.fr

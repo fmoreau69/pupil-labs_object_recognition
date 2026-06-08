@@ -1,0 +1,6 @@
+# LSL relay (lsl_relay.py) — Python 3.12 venv
+# Re-publishes the plugin's object data to LSL for multi-sensor synchronisation.
+#   pip install -r requirements-relay.txt
+pyzmq
+msgpack
+pylsl

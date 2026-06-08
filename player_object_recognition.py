@@ -17,6 +17,7 @@ Runs in the Pupil Player bundle (Python 3.6); only deps already present are used
 opencv, msgpack, pyglui. The external detector must be running (``python yolo_server.py``).
 """
 import glob
+import csv
 import logging
 import os
 import threading
@@ -31,6 +32,19 @@ from pyglui.cygl.utils import draw_gl_texture
 
 import gl_utils
 from plugin import Plugin
+
+# Flat CSV columns for the observed object (easy offline merge with LSL/XDF + RTMaps logs by ts).
+CSV_HEADER = ["frame_index", "timestamp", "gaze_x", "gaze_y", "observed_name", "observed_id",
+              "observed_conf", "obs_x1", "obs_y1", "obs_x2", "obs_y2", "n_objects"]
+
+
+def datum_csv_row(datum):
+    f = datum.get("focus") or {}
+    box = f.get("box") or ["", "", "", ""]
+    gaze = datum.get("gaze_2d") or ["", ""]
+    return [datum.get("frame_index"), datum.get("timestamp"), gaze[0], gaze[1],
+            f.get("name", ""), f.get("id", ""), f.get("conf", ""),
+            box[0], box[1], box[2], box[3], len(datum.get("objects", []))]
 
 try:
     from file_methods import PLData_Writer, load_pldata_file
@@ -282,6 +296,9 @@ class Object_Recognition_Player(Plugin):
             gaze_ts, gaze_norm = self._load_gaze(rec_dir)
             cap = cv2.VideoCapture(world)
             writer = PLData_Writer(rec_dir, "objects")
+            csv_file = open(os.path.join(rec_dir, "objects.csv"), "w", newline="")
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(CSV_HEADER)
 
             ctx = zmq.Context()
             sock = ctx.socket(zmq.REQ)
@@ -310,17 +327,19 @@ class Object_Recognition_Player(Plugin):
                     rep = msgpack.unpackb(sock.recv(), raw=False)
                 except zmq.ZMQError as exc:
                     st.update(running=False, msg="detector not responding: {}".format(exc))
-                    cap.release(); writer.close(); sock.close(0); ctx.term()
+                    cap.release(); writer.close(); csv_file.close(); sock.close(0); ctx.term()
                     return
                 detections = rep.get("detections", [])
 
                 datum = self._build_datum(t, i, gaze2d, detections)
                 writer.append(datum)
+                csv_writer.writerow(datum_csv_row(datum))
                 st["done"] = i + 1
                 st["msg"] = "{}/{} frames".format(i + 1, total)
 
             cap.release()
             writer.close()
+            csv_file.close()
             sock.close(0)
             ctx.term()
             if not st["cancel"]:

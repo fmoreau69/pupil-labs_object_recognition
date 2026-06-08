@@ -1,59 +1,86 @@
-# python zmq_consumer.py --port 5555
-import rtmaps.types
-import os
-import cv2
-import argparse
+"""RTMaps Python component: receive object-recognition data from the Pupil plugin over ZMQ.
+
+Drop this into an RTMaps Python block. It SUBSCRIBEs to the plugin's data-export PUB socket
+(enable "Stream object data (RTMaps/LSL)" in the plugin, default bind tcp://*:5561) and exposes the
+per-frame object data as RTMaps outputs.
+
+Replaces the previous imagezmq-based version: plain pyzmq, no extra dependency.
+
+Wire format (msgpack), multipart [b"objects", payload]:
+    {topic, timestamp, frame_index, gaze_2d:[x,y]|None,
+     focus:{id,name,conf,box:[x1,y1,x2,y2],mask}|None,
+     objects:[{id,kind,engine,name,conf,box}, ...]}
+"""
+import json
+
 import numpy as np
-import imagezmq
-from rtmaps.base_component import BaseComponent  # base class
+import zmq
+import msgpack
+
+import rtmaps.types
 import rtmaps.core as rt
 import rtmaps.reading_policy
-from PIL import Image
+from rtmaps.base_component import BaseComponent
 
 
-# Python class that will be called from RTMaps.
 class rtmaps_python(BaseComponent):
     def __init__(self):
-        BaseComponent.__init__(self)  # call base class constructor
+        BaseComponent.__init__(self)
         self.force_reading_policy(rtmaps.reading_policy.SAMPLING)
-        self.SERVER_PORT = 12001
-        self.server_port = self.SERVER_PORT
-        self.open_port = 'tcp://127.0.0.1:{}'.format(self.server_port)
-        self.image_hub = imagezmq.ImageHub(open_port=self.open_port, REQ_REP=False)
-        # Add properties
-        #self.add_property("IP", '127.0.0.1')    # If you talk to a different machine use its IP.
-        #self.add_property("Port", 5555)    # The port defaults to 5555.
+        self.sub = None
+        self.poller = None
 
-    # All inputs, outputs and properties MUST be created in the
-    # Dynamic() function.
     def Dynamic(self):
-        self.add_output("images", rtmaps.types.IPL_IMAGE)  # define output
+        # Address of the plugin's export socket. Use the Pupil host IP on a LAN.
+        self.add_property("sub_address", "tcp://127.0.0.1:5561")
+        # Outputs
+        self.add_output("observed_name", rtmaps.types.TEXT_UTF8)     # observed object class, "" if none
+        self.add_output("observed_box", rtmaps.types.FLOAT64)        # [x1, y1, x2, y2]
+        self.add_output("observed_id", rtmaps.types.INTEGER64)       # track id, -1 if none
+        self.add_output("gaze", rtmaps.types.FLOAT64)                # [x, y] in world pixels
+        self.add_output("n_objects", rtmaps.types.INTEGER64)
+        self.add_output("pupil_timestamp", rtmaps.types.FLOAT64)
+        self.add_output("json", rtmaps.types.TEXT_UTF8)              # full datum as JSON
 
-    # Birth() will be called once at diagram execution startup
     def Birth(self):
-        print('Open Port is {}'.format(self.open_port))
+        addr = self.properties["sub_address"].data
+        ctx = zmq.Context.instance()
+        self.sub = ctx.socket(zmq.SUB)
+        self.sub.connect(addr)
+        self.sub.setsockopt_string(zmq.SUBSCRIBE, "objects")
+        self.poller = zmq.Poller()
+        self.poller.register(self.sub, zmq.POLLIN)
+        rt.report_info("Subscribed to {}".format(addr))
 
-    # Core() is called every time you have a new input
     def Core(self):
-        print('Receiving frames...')
-        out = rtmaps.types.Ioelt()
-        out.data = rtmaps.types.IplImage()
-        out.data.color_model = "COLR"  # Color model can also be : RGB, RGBA, YUV, YUVA, GRAY... (SDK C++ for more)
-        out.data.channel_seq = "RGB"
-        # show streamed images
-        while True:
-            # tpye(jpg_buffer) is <class 'zmq.sugar.frame.Frame'>
-            host_name, jpg_buffer = self.image_hub.recv_jpg()
-            #self.image_hub.send_reply(b'OK')
-            # image is 1-d numpy.ndarray and decode to 3-d array
-            image = np.frombuffer(jpg_buffer, dtype='uint8')
-            image = cv2.imdecode(image, -1)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(image)
-            out.data.image_data = np.array(image)
-            self.outputs["images"].write(out)  # and write it to the output
+        # Drain to the most recent message so RTMaps stays in sync with the live stream.
+        datum = None
+        while dict(self.poller.poll(5)).get(self.sub) == zmq.POLLIN:
+            _topic, payload = self.sub.recv_multipart()
+            datum = msgpack.unpackb(payload, raw=False)
+        if datum is None:
+            return
 
-    # Death() will be called once at diagram execution shutdown
+        focus = datum.get("focus") or {}
+        box = focus.get("box") or [0.0, 0.0, 0.0, 0.0]
+        gaze = datum.get("gaze_2d") or [0.0, 0.0]
+        ts = float(datum.get("timestamp", 0.0))
+
+        self._write("observed_name", focus.get("name", ""), ts)
+        self._write("observed_box", [float(v) for v in box], ts)
+        self._write("observed_id", int(focus["id"]) if focus.get("id") is not None else -1, ts)
+        self._write("gaze", [float(gaze[0]), float(gaze[1])], ts)
+        self._write("n_objects", int(len(datum.get("objects", []))), ts)
+        self._write("pupil_timestamp", ts, ts)
+        self._write("json", json.dumps(datum), ts)
+
+    def _write(self, name, value, ts):
+        out = rtmaps.types.Ioelt()
+        out.data = value
+        out.ts = int(ts * 1e6)  # RTMaps timestamps are in microseconds
+        self.outputs[name].write(out)
+
     def Death(self):
-        self.image_hub.close()
+        if self.sub is not None:
+            self.sub.close(0)
         rt.report_info("Death")

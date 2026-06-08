@@ -97,7 +97,7 @@ python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front
 
 | Donnée                                   | Transport                         | Destination            | Phase |
 |------------------------------------------|-----------------------------------|------------------------|:-----:|
-| Objets (label, box/masque, conf, gaze)   | IPC backbone Pupil + `.pldata`    | Pupil natif / Player   |  v1   |
+| Objets (label, box/masque, conf, gaze)   | IPC backbone + `.pldata` + `.csv` | Pupil natif / Player / analyse |  v1   |
 | Objets                                   | **pylsl** outlet                  | LabRecorder / WAMA     |   3   |
 | Objets                                   | **pyzmq** PUB                     | RTMaps                 |   1+  |
 | Vidéo world brute                        | (enregistrée par Pupil)           | —                      |   —   |
@@ -122,15 +122,21 @@ partir des données objets horodatées.
 - Publication propre sur l'IPC backbone (`g_pool.ipc_pub.send`, topic `objects`).
 - Écriture des données dans le dossier de recording (`file_methods.PLData_Writer`) → re-chargeable
   dans Pupil Player.
-- Export ZMQ PUB → RTMaps (objet observé + coordonnées de boîte). *(optionnel en v1)*
+- **Export ZMQ PUB → RTMaps** — **fait** : le plugin publie le datum par frame sur un socket PUB
+  (switch « Stream object data (RTMaps/LSL) », bind `tcp://*:5561`). `rtmaps_stream.py` (réécrit en
+  pyzmq nu, `imagezmq` supprimé) le consomme en SUB et expose : objet observé, boîte, id, gaze,
+  nombre d'objets, timestamp Pupil, JSON complet.
 
 ### Phase 2 — Segmentation (intégrée dès la v1)
 - `yolo11n-seg`, overlay des masques, matching point-dans-polygone (`cv2.pointPolygonTest`).
 - Gain qualitatif : « regarde la voiture » vs « regarde le ciel derrière la boîte ».
 
-### Phase 3 — LSL
-- Outlet `pylsl` des données objets (côté serveur), horloge `local_clock()`.
+### Phase 3 — LSL — **fait**
+- `lsl_relay.py` (venv 3.12) : SUB sur le socket PUB du plugin → deux outlets LSL horodatés
+  `local_clock()` : numérique 7 canaux `[observed, x1,y1,x2,y2, gaze_x, gaze_y]` + flux marqueur
+  string (datum JSON complet). `pylsl` reste hors du bundle 3.6 (`requirements-relay.txt`).
 - Base de la synchro multi-sources pour l'intégration WAMA (gaze + véhicule + EEG/GSR…).
+- ⚠️ À valider en live : sortie réelle vers LabRecorder (pylsl non installé/testé ici).
 
 ### Phase 4 — Pupil Player + moteurs avancés
 - **Moteurs serveur** (`engines.py`) : abstraction multi-moteurs `yolo` / `yolopv2` / `sam3`,
@@ -143,8 +149,9 @@ partir des données objets horodatées.
      sans `objects.pldata`), itère sur les frames (lecture directe `world.mp4` +
      `world_timestamps.npy` + `gaze.pldata`), ré-applique la détection (client ZMQ vers le serveur,
      mêmes moteurs) **et le matching du regard** (plus proche gaze par timestamp), puis écrit
-     `objects.pldata` (masques complets pour tous les objets → relecture fidèle). Traite a
-     posteriori des données oculo déjà acquises sans le plugin. Idéal pour SAM3 hors temps réel.
+     `objects.pldata` (masques complets pour tous les objets → relecture fidèle) **et `objects.csv`**
+     (objet observé à plat, pour fusion offline par timestamp avec les logs LSL/XDF + RTMaps).
+     Traite a posteriori des données oculo déjà acquises sans le plugin. Idéal pour SAM3 hors temps réel.
 - Le matching gaze réutilise la même logique point-dans-boîte / point-dans-masque que Capture.
 - ⚠️ À vérifier en live : rendu Player (`frame.img` vs `gl_display`) et API
   `PLData_Writer`/`load_pldata_file` du bundle (codés selon l'API standard, non exécutés ici).
@@ -163,10 +170,12 @@ partir des données objets horodatées.
 
 | Fichier                      | Env    | Rôle                                                       |
 |------------------------------|:------:|------------------------------------------------------------|
-| `yolo_server.py`             | 3.12   | Serveur ZMQ REP : frame → YOLO → détections/masques        |
-| `detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC)|
-| `requirements-detector.txt`  | 3.12   | Dépendances du venv détecteur                              |
-| `rtmaps_stream.py`           | RTMaps | Réception ZMQ côté RTMaps (réécrit en pyzmq nu) — phase 1+ |
+| `yolo_server.py` + `engines.py` | 3.12 | Serveur ZMQ REP multi-moteurs : frame → détections/masques |
+| `detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
+| `player_object_recognition.py` | 3.6  | Plugin Pupil Player (relecture + retraitement offline)     |
+| `rtmaps_stream.py`           | RTMaps | Réception ZMQ côté RTMaps (pyzmq nu) → données objet        |
+| `lsl_relay.py`               | 3.12   | Relais ZMQ→LSL (outlets numérique + JSON) pour synchro multi-capteurs |
+| `requirements-detector.txt` / `requirements-relay.txt` | 3.12 | Dépendances venv détecteur / relais LSL          |
 | `~Archives/`                 | —      | `darknet`, `imagezmq`, ancien plugin (nettoyage versionning ultérieur) |
 
 ---
@@ -187,3 +196,8 @@ partir des données objets horodatées.
    « Object Recognition (YOLO) » dans le Plugin Manager.
    - Player : si le recording contient déjà `objects.pldata` → relecture auto de l'overlay ; sinon
      bouton **Reprocess recording** (détecteur lancé) pour le générer.
+4. **Export multi-capteurs** (optionnel) : dans le plugin Capture, activer « Stream object data
+   (RTMaps/LSL) ». Puis :
+   - **RTMaps** : `rtmaps_stream.py` dans un bloc Python RTMaps (propriété `sub_address`).
+   - **LSL** : `pip install -r requirements-relay.txt` puis `python lsl_relay.py`
+     (`--connect tcp://<hôte_pupil>:5561`) ; les flux apparaissent dans LabRecorder.
