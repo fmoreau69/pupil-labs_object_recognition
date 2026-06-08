@@ -174,7 +174,9 @@ class Object_Recognition_YOLO(Plugin):
     def __init__(self, g_pool, server_address="tcp://127.0.0.1:5560", conf=0.25,
                  smooth=0.5, max_rate=30.0, sight_only=False, show_masks=True, show_ids=False,
                  classes_filter="", detect_floor=0.10,
-                 export_enabled=False, export_address="tcp://*:5561"):
+                 export_enabled=False, export_address="tcp://*:5561",
+                 video_stream_enabled=False, video_stream_address="tcp://*:5562",
+                 record_overlay=False):
         super().__init__(g_pool)
         self.order = 0.1  # run early so downstream plugins can use the "objects" events
 
@@ -193,6 +195,10 @@ class Object_Recognition_YOLO(Plugin):
         # Publish object data on a ZMQ PUB socket for external sinks (RTMaps subscriber, LSL relay).
         self.export_enabled = export_enabled
         self.export_address = export_address  # bind address; "tcp://*:5561" = all interfaces (LAN)
+        # Annotated world video: stream the overlaid frame to RTMaps and/or record it to a file.
+        self.video_stream_enabled = video_stream_enabled
+        self.video_stream_address = video_stream_address  # separate PUB, default tcp://*:5562
+        self.record_overlay = record_overlay  # write world_overlay.mp4 during a Pupil recording
         self.activation_state = False     # detection on/off
 
         # runtime state
@@ -210,6 +216,11 @@ class Object_Recognition_YOLO(Plugin):
         self._csv_writer = None
         self._pub = None                  # ZMQ PUB socket for data export
         self._pub_ctx = None
+        self._vpub = None                 # ZMQ PUB socket for annotated video
+        self._vpub_ctx = None
+        self._video_writer = None         # cv2.VideoWriter for world_overlay.mp4
+        self._rec_active = False
+        self._rec_path = None
         self._draw_fps = 0.0
         self._last_submit = 0.0
 
@@ -267,6 +278,18 @@ class Object_Recognition_YOLO(Plugin):
         ))
 
         self.menu.append(ui.Separator())
+        self.menu.append(ui.Text_Input("video_stream_address", self, label="Video bind address"))
+        self.menu.append(ui.Switch("video_stream_enabled", self, label="Stream annotated video (RTMaps)",
+                                   setter=self._toggle_video_stream))
+        self.menu.append(ui.Switch("record_overlay", self, label="Record annotated video"))
+        self.menu.append(ui.Info_Text(
+            "Annotated world view (overlay burned in). Streaming pushes JPEG frames on a separate "
+            "PUB socket (default tcp://*:5562) for RTMaps (rtmaps_video.py). Recording writes "
+            "world_overlay.mp4 into the recording folder during a Pupil recording. Both only run "
+            "while object recognition is active."
+        ))
+
+        self.menu.append(ui.Separator())
         self.menu.append(ui.Switch("activation_state", self, label="Launch object recognition",
                                    setter=self._toggle_activation))
         self.status_text = ui.Info_Text("Detector: idle")
@@ -274,6 +297,8 @@ class Object_Recognition_YOLO(Plugin):
 
         if self.export_enabled:  # restored from a previous session
             self._open_pub()
+        if self.video_stream_enabled:
+            self._open_vpub()
 
     def deinit_ui(self):
         self.remove_menu()
@@ -293,6 +318,13 @@ class Object_Recognition_YOLO(Plugin):
             self._open_pub()
         else:
             self._close_pub()
+
+    def _toggle_video_stream(self, value):
+        self.video_stream_enabled = value
+        if value:
+            self._open_vpub()
+        else:
+            self._close_vpub()
 
     # --- data export (ZMQ PUB) ------------------------------------------------------------
     def _open_pub(self):
@@ -321,6 +353,70 @@ class Object_Recognition_YOLO(Plugin):
         self._pub = None
         self._pub_ctx = None
 
+    # --- annotated video (ZMQ PUB stream + file recording) --------------------------------
+    def _open_vpub(self):
+        self._close_vpub()
+        try:
+            self._vpub_ctx = zmq.Context()
+            self._vpub = self._vpub_ctx.socket(zmq.PUB)
+            self._vpub.setsockopt(zmq.LINGER, 0)
+            self._vpub.set_hwm(2)  # drop old frames rather than buffer; keep the stream live
+            self._vpub.bind(self.video_stream_address)
+            logger.info("annotated video stream bound to %s", self.video_stream_address)
+        except Exception as exc:
+            logger.warning("could not bind video socket %s: %s", self.video_stream_address, exc)
+            self._close_vpub()
+
+    def _close_vpub(self):
+        if self._vpub is not None:
+            try:
+                self._vpub.close(0)
+            except Exception:  # pragma: no cover
+                pass
+        if self._vpub_ctx is not None:
+            try:
+                self._vpub_ctx.term()
+            except Exception:  # pragma: no cover
+                pass
+        self._vpub = None
+        self._vpub_ctx = None
+
+    def _stream_video(self):
+        if not self.video_stream_enabled or self._vpub is None or self.img is None:
+            return
+        try:
+            ok, jpg = cv2.imencode(".jpg", self.img)
+            if ok:
+                self._vpub.send_multipart([b"frame", jpg.tobytes()], flags=zmq.NOBLOCK)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("video stream send failed: %s", exc)
+
+    def _record_overlay_frame(self):
+        if not (self.record_overlay and self._rec_active and self._rec_path) or self.img is None:
+            return
+        if self._video_writer is None:
+            h, w = self.img.shape[:2]
+            fps = float(getattr(self.g_pool.capture, "frame_rate", 30) or 30)
+            path = os.path.join(self._rec_path, "world_overlay.mp4")
+            self._video_writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            if not self._video_writer.isOpened():
+                logger.warning("could not open %s (mp4v); overlay recording disabled", path)
+                self._video_writer = None
+                self.record_overlay = False
+                return
+        try:
+            self._video_writer.write(self.img)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("overlay video write failed: %s", exc)
+
+    def _close_video_writer(self):
+        if self._video_writer is not None:
+            try:
+                self._video_writer.release()
+            except Exception:  # pragma: no cover
+                pass
+            self._video_writer = None
+
     # --- detector client lifecycle --------------------------------------------------------
     def start_client(self):
         if self.client is None:
@@ -342,9 +438,13 @@ class Object_Recognition_YOLO(Plugin):
     def on_notify(self, notification):
         subject = notification.get("subject", "")
         if subject == "recording.started":
-            self._open_writer(notification.get("rec_path"))
+            self._rec_path = notification.get("rec_path")
+            self._rec_active = True
+            self._open_writer(self._rec_path)
         elif subject == "recording.stopped":
+            self._rec_active = False
             self._close_writer()
+            self._close_video_writer()
 
     def _open_writer(self, rec_path):
         self._close_writer()
@@ -436,6 +536,10 @@ class Object_Recognition_YOLO(Plugin):
                     self._csv_writer.writerow(datum_csv_row(datum))
                 except Exception as exc:  # pragma: no cover
                     logger.debug("CSV write failed: %s", exc)
+
+        # Annotated frame is ready (overlay drawn): stream / record it.
+        self._stream_video()
+        self._record_overlay_frame()
 
         dt = time.time() - t_prev
         if dt > 0:
@@ -599,9 +703,14 @@ class Object_Recognition_YOLO(Plugin):
             "classes_filter": self.classes_filter,
             "export_enabled": self.export_enabled,
             "export_address": self.export_address,
+            "video_stream_enabled": self.video_stream_enabled,
+            "video_stream_address": self.video_stream_address,
+            "record_overlay": self.record_overlay,
         }
 
     def cleanup(self):
         self.stop_client()
         self._close_writer()
         self._close_pub()
+        self._close_vpub()
+        self._close_video_writer()

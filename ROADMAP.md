@@ -101,7 +101,7 @@ python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front
 | Objets                                   | **pylsl** outlet                  | LabRecorder / WAMA     |   3   |
 | Objets                                   | **pyzmq** PUB                     | RTMaps                 |   1+  |
 | Vidéo world brute                        | (enregistrée par Pupil)           | —                      |   —   |
-| Vidéo annotée (overlay)                  | pyzmq PUB                         | RTMaps                 |   5   |
+| Vidéo annotée (overlay)                  | pyzmq PUB (JPEG) + `world_overlay.mp4` | RTMaps / fichier  | fait (5) |
 
 **Vidéo + LSL** : on ne pousse pas la vidéo dans LSL (pertes de frames). La vidéo brute est
 enregistrée par Pupil ; l'overlay est **reconstruit à la relecture** dans le plugin Pupil Player à
@@ -161,8 +161,14 @@ partir des données objets horodatées.
   détecte tout (aucun impact perf), **toutes** les détections restent enregistrées, seul l'overlay
   et l'éligibilité au focus sont filtrés. Liste des classes vues affichée pour la découverte.
 
-### Phase 5 — Vidéo annotée
-- Stream/enregistrement de la vidéo surchargée de l'overlay (pyzmq → RTMaps), si pertinent.
+### Phase 5 — Vidéo annotée — **fait**
+- **Stream** : socket ZMQ PUB séparé (switch « Stream annotated video (RTMaps) », bind `tcp://*:5562`)
+  qui pousse la frame surchargée en JPEG (`[b"frame", jpg]`). `rtmaps_video.py` (pyzmq nu) la reçoit
+  et l'expose en IPL_IMAGE dans RTMaps.
+- **Enregistrement** : switch « Record annotated video » → écrit `world_overlay.mp4` (codec mp4v)
+  dans le dossier du recording pendant un enregistrement Pupil. Repli propre + warning si le codec
+  manque. Les deux ne tournent que lorsque la détection est active.
+- ⚠️ À valider en live : réception RTMaps (`rtmaps_video.py`) et codec mp4v dans l'OpenCV du bundle.
 
 ---
 
@@ -174,6 +180,7 @@ partir des données objets horodatées.
 | `detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
 | `player_object_recognition.py` | 3.6  | Plugin Pupil Player (relecture + retraitement offline)     |
 | `rtmaps_stream.py`           | RTMaps | Réception ZMQ côté RTMaps (pyzmq nu) → données objet        |
+| `rtmaps_video.py`            | RTMaps | Réception ZMQ côté RTMaps → vidéo annotée (IPL_IMAGE)       |
 | `lsl_relay.py`               | 3.12   | Relais ZMQ→LSL (outlets numérique + JSON) pour synchro multi-capteurs |
 | `requirements-detector.txt` / `requirements-relay.txt` | 3.12 | Dépendances venv détecteur / relais LSL          |
 | `~Archives/`                 | —      | `darknet`, `imagezmq`, ancien plugin (nettoyage versionning ultérieur) |

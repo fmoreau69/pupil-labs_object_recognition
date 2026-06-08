@@ -118,6 +118,8 @@ Leave it running. The model file (~6 MB) downloads automatically on first launch
 | Show track ids | Prefix labels with the track id (`#3`). `#-` means the detector returned no id → it's not tracking (restart `yolo_server.py` without `--no-track`). |
 | Only observed object | Draw/keep only the looked-at object. |
 | Stream object data (RTMaps/LSL) | Publish the per-frame object data on a ZMQ PUB socket (see Exports). |
+| Stream annotated video (RTMaps) | Publish the overlaid world frame (JPEG) on a separate PUB socket for RTMaps. |
+| Record annotated video | Write `world_overlay.mp4` into the recording folder during a Pupil recording. |
 
 ### Pupil Player
 
@@ -141,6 +143,14 @@ exposes it on the LAN; `tcp://127.0.0.1:5561` is localhost only). Then:
   `PupilObjects` (numeric: `observed, x1, y1, x2, y2, gaze_x, gaze_y`) and `PupilObjects_json`
   (full datum as a string marker) — recordable in LabRecorder.
 
+**Annotated video** (overlay burned in) — enable **Stream annotated video (RTMaps)** and/or
+**Record annotated video**:
+
+- **RTMaps**: set the `rtmaps_video.py` block's `sub_address` to `tcp://<pupil-host>:5562` to view
+  the overlaid world camera live in RTMaps.
+- **File**: with a Pupil recording running, `world_overlay.mp4` is written into the recording
+  folder. (For Player you usually don't need it — the overlay is rebuilt from `objects.pldata`.)
+
 > **Offline note**: LSL/RTMaps are *live* sync transports. If you detect only in post-processing,
 > use `objects.pldata` / `objects.csv` and merge with your live LSL/XDF + RTMaps logs **by
 > timestamp** — don't stream offline (the replay clock ≠ session clock).
@@ -153,8 +163,10 @@ exposes it on the LAN; `tcp://127.0.0.1:5561` is localhost only). Then:
 |---|---|---|
 | `objects.pldata` | recording folder | Full per-frame data (Pupil-native, re-loadable in Player). |
 | `objects.csv` | recording folder | Flat per-frame row: frame, timestamp, gaze, observed name/id/box, object count. |
+| `world_overlay.mp4` | recording folder | Annotated world video (optional, "Record annotated video"). |
 | IPC topic `objects` | Pupil IPC backbone | Live, for other Pupil plugins / network clients. |
 | ZMQ PUB (`tcp://*:5561`) | network | `[b"objects", msgpack(datum)]` per frame → RTMaps / LSL relay. |
+| ZMQ PUB (`tcp://*:5562`) | network | `[b"frame", jpg]` annotated video → RTMaps (`rtmaps_video.py`). |
 
 Per-frame **datum**: `{topic, timestamp, frame_index, gaze_2d, focus:{id,name,conf,box,mask},
 objects:[{id,kind,engine,name,conf,box}]}`. `kind` is `object` (instance) or `layer` (semantic
