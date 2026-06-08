@@ -127,3 +127,17 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# --- Project-specific ---
+# JetBrains IDE
+.idea/
+
+# Model weights (downloaded on first run; see requirements-detector.txt)
+*.pt
+
+# Archived legacy code (darknet, imagezmq) kept locally, not versioned
+~Archives/
+
+# Detector server test logs / local exports
+server_test*.log
+data/

@@ -1,531 +1,505 @@
-'''
-(*)~----------------------------------------------------------------------------------
- Pupil - eye tracking platform
- Copyright (C) 2012-2015  Pupil Labs
- Distributed under the terms of the CC BY-NC-SA License.
- License details are in the file license.txt, distributed as part of this software.
-----------------------------------------------------------------------------------~(*)
-'''
-import json
-import string
-from pydoc import replace
-from typing import List
+"""
+Object Recognition (YOLO) — Pupil Capture plugin.
+
+Lightweight plugin that runs inside the Pupil Capture *bundle* (Python 3.6). It does NOT run
+YOLO itself: the heavy ultralytics/torch inference lives in an external process
+(``yolo_server.py``, Python 3.12 venv) that the plugin talks to over a ZMQ REQ/REP socket on
+localhost.
+
+Responsibilities of this plugin:
+  * grab the world frame + gaze in ``recent_events``;
+  * hand the frame to a background worker thread that round-trips it to the detector
+    (so the world process is never blocked by inference);
+  * match the gaze position against detected boxes/masks to find the *observed* object;
+  * draw the overlay (observed object in red, others in green);
+  * publish object data on the Pupil IPC backbone (topic ``objects``);
+  * write object data into the recording directory so it can be reloaded in Pupil Player.
+
+Only dependencies already present in the bundle are used: pyzmq, numpy, opencv, msgpack, pyglui.
+"""
+import logging
+import os
+import queue
+import threading
+import time
 
 import cv2
+import msgpack
 import numpy as np
 import zmq
-import msgpack
 from pyglui import ui
-from pyglui.cygl.utils import draw_polyline, draw_points, RGBA, draw_gl_texture
+from pyglui.cygl.utils import draw_gl_texture
+
 import gl_utils
-from glfw import *
-from imagezmq import imagezmq
-import argparse
-import socket
-import time
-import os
-
 from plugin import Plugin
-# logging
-import logging
 
-#from pupil.capture_settings.plugins.darknet.build.darknet.x64.darknet import *
-#from pupil.capture_settings.plugins.darknet.build.darknet.x64.darknet_video import *
-
-# you should copy your darknet folder next to detection_plugin.py in the plugin folder
-from darknet.build.darknet.x64.darknet import *
-from darknet.build.darknet.x64.darknet_video import *
+try:
+    from file_methods import PLData_Writer
+except Exception:  # pragma: no cover - API guard
+    PLData_Writer = None
 
 logger = logging.getLogger(__name__)
-USER = os.getlogin()
 
-OBJ_DATA = "object"
+# Colors are in BGR (OpenCV order).
+COLOR_OBSERVED = (12, 15, 145)    # red  (#9C210C) — object the participant is looking at
+COLOR_OTHER = (172, 183, 114)     # green/teal (#72B7AC) — other detected objects
 
-class Yolov4_Detection_Plugin(Plugin):
-    """Describe your plugin here
+# Semantic layers (road/lane/...) are drawn as translucent fills, by name.
+LAYER_COLORS = {
+    "drivable area": (180, 200, 90),
+    "drivable area (sam3)": (180, 200, 90),
+    "lane": (40, 200, 255),
+}
+LAYER_DEFAULT_COLOR = (200, 120, 200)
+LAYER_ALPHA = 0.35
 
+
+class DetectorClient(threading.Thread):
+    """Background thread that ships frames to the external YOLO server and keeps the latest result.
+
+    The plugin submits the most recent frame via :meth:`submit` (old frames are dropped) and reads
+    the latest detections via :meth:`get_result`. The ZMQ socket lives entirely in this thread
+    (ZMQ sockets are not thread-safe). On timeout/error the socket is recreated so a missing or
+    restarted server never wedges the plugin.
     """
-    def __init__(self, g_pool, my_persistent_var=10.0, ):
-        super(Yolov4_Detection_Plugin, self).__init__(g_pool)
-        # order (0-1) determines if your plugin should run before other plugins or after
-        self.order = .1
 
-        # all markers that are detected in the most recent frame
-        self.my_var = my_persistent_var
-        # attribute for the UI
-        self.window = None
+    def __init__(self, address, recv_timeout_ms=1000):
+        super().__init__(daemon=True)
+        self.address = address
+        self.recv_timeout_ms = recv_timeout_ms
+
+        self._inbox = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self._result = None          # latest reply dict from the server
+        self._stop = threading.Event()
+        self.connected = False
+        self.last_error = None
+        self.infer_fps = 0.0
+
+    # --- producer side (called from the world thread) -------------------------------------
+    def submit(self, frame_bgr, params):
+        """Queue the latest frame (+ inference params), dropping any previous un-processed one."""
+        if self._inbox.full():
+            try:
+                self._inbox.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._inbox.put_nowait((frame_bgr, params))
+        except queue.Full:
+            pass
+
+    def get_result(self):
+        with self._lock:
+            return self._result
+
+    def stop(self):
+        self._stop.set()
+
+    # --- worker thread --------------------------------------------------------------------
+    def _new_socket(self, ctx):
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, self.recv_timeout_ms)
+        sock.setsockopt(zmq.SNDTIMEO, self.recv_timeout_ms)
+        sock.connect(self.address)
+        return sock
+
+    def run(self):
+        ctx = zmq.Context()
+        sock = self._new_socket(ctx)
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        try:
+            while not self._stop.is_set():
+                try:
+                    frame, params = self._inbox.get(timeout=0.3)
+                except queue.Empty:
+                    continue
+
+                t_start = time.time()
+                ok, jpg = cv2.imencode(".jpg", frame)
+                if not ok:
+                    continue
+                msg = {"jpg": jpg.tobytes()}
+                msg.update(params)
+                payload = msgpack.packb(msg, use_bin_type=True)
+
+                try:
+                    sock.send(payload)
+                    socks = dict(poller.poll(self.recv_timeout_ms))
+                    if socks.get(sock) == zmq.POLLIN:
+                        reply = msgpack.unpackb(sock.recv(), raw=False)
+                        with self._lock:
+                            self._result = reply
+                        self.connected = True
+                        self.last_error = reply.get("error")
+                        dt = time.time() - t_start
+                        if dt > 0:
+                            self.infer_fps = 0.7 * self.infer_fps + 0.3 * (1.0 / dt)
+                    else:
+                        raise zmq.ZMQError(msg="recv timeout")
+                except zmq.ZMQError as exc:
+                    # Reset the (now stuck) REQ socket and mark disconnected.
+                    self.connected = False
+                    self.last_error = str(exc)
+                    poller.unregister(sock)
+                    sock.close(0)
+                    sock = self._new_socket(ctx)
+                    poller.register(sock, zmq.POLLIN)
+        finally:
+            sock.close(0)
+            ctx.term()
+
+
+class Object_Recognition_YOLO(Plugin):
+    """Detects/segments objects in the world view and flags the one the participant is looking at."""
+
+    icon_chr = "O"
+
+    def __init__(self, g_pool, server_address="tcp://127.0.0.1:5560", conf=0.25,
+                 smooth=0.5, max_rate=30.0, sight_only=False, show_masks=True, show_ids=False,
+                 classes_filter="", detect_floor=0.10):
+        super().__init__(g_pool)
+        self.order = 0.1  # run early so downstream plugins can use the "objects" events
+
+        # settings (persisted via get_init_dict)
+        self.server_address = server_address
+        self.conf = conf                  # DISPLAY confidence threshold (filters overlay + focus)
+        self.detect_floor = detect_floor  # detection floor sent to the server (data keeps everything above this)
+        self.smooth = smooth              # temporal smoothing strength (0..0.95), applied server-side
+        self.max_rate = max_rate          # max detections/s; overlay holds between inferences
+        self.sight_only = sight_only      # only draw/export the observed object
+        self.show_masks = show_masks
+        self.show_ids = show_ids          # show track ids in labels
+        # comma-separated class names to DISPLAY; empty = show all. The detector still finds
+        # everything (full data is recorded); this only filters what is drawn / eligible as focus.
+        self.classes_filter = classes_filter
+        self.activation_state = False     # detection on/off
+
+        # runtime state
+        self._whitelist = frozenset()     # parsed, lowercased classes_filter
+        self._seen_classes = set()        # object class names seen so far (for discovery)
+        self.classes_text = None
         self.menu = None
+        self.status_text = None
         self.img = None
-        self.color = {
-            "blue": [172, 183, 114],  # color : #5AA333 colors are in BGR format
-            "red": [12, 15, 145]  # color : #9C2118
-            }
-        # booleans used in switches
-        self.activation_state = False  # determine if object detection is active or not
-        self.detect_mode = "Yolo 608 (best precision)"  # determine the model to use
-        self.new_window = False  # determine if we open a new window for object detection
-        self.model_loaded = False  # determine if we have loaded a model
-        self.sight_only = False
-        self.export = False
-        self.is_streaming = False
-
-        # streaming attributes
-        self.SERVER_IP = "127.0.0.1"
-        self.SERVER_PORT = 12001 # if you get errors while streaming, try different port number
-        self.HOST_NAME = "localhost"
-        self.sender = imagezmq.ImageSender(connect_to="tcp://{}:{}".format(self.SERVER_IP, self.SERVER_PORT))
-
-        # we need to create a darknet image then use it for every detection
-        self.darknet_image = None
-        self.network_image_size = 608
-        self.fps = 29.97
-
+        self.width, self.height = 1280, 720
         self.gaze_position_2d = []
-        self.focus_object_index=-1
-        self.data = None
-        self.width = 1280
-        self.height = 720
-        self.codec = cv2.VideoWriter_fourcc(*'DIVX') # codec use to create .avi video file
-        # stream definition is HD by default but you can change it
-        self.out = None
-    def init_ui(self):
-        # lets make a menu entry in the sidebar
-        self.add_menu()
-        self.menu.label = 'Yolo v4 Detection'
-        self.menu.append(
-            ui.Info_Text(
-                "Classifies and labels objects seen by the user in the world camera video. Boxes will appear around objects, with their name and the confidence score at the top. When an object is being focused it will be exported to IPC Backbone in the topic \"object\""
-            )
-        )
-        # here we add the selector for precision or speed
-        detect_mode = ["Yolo 608 (best precision)", "Yolo 512", "Yolo 416", "Yolo 320", "Yolo Tiny (fastest)", "Yolo Mish (RTX 2070)","Yolo SAM Mish 512","Yolo Leaky (GTX 1080ti)", "Custom"]
-        self.menu.append(
-            ui.Selector(
-                "detect_mode", self, selection=detect_mode, label="Optimize for"
-            )
-        )
-        self.menu.append(
-            ui.Info_Text(
-                "Yolo 608/512 for precision, Yolo Tiny for speed, Yolo 416/320 for a good compromise."
-            )
-        )
-        self.menu.append(
-            ui.Info_Text(
-                "Yolo Mish is optimized for RTX 2070 (8GB), Yolo Leaky is optimized for GTX 1080ti (11GB). Yolo SAM Mish should be used with 16GB card minimum."
-            )
-        )
+        self.client = None
+        self._writer = None
+        self._draw_fps = 0.0
+        self._last_submit = 0.0
 
-        # here we add the switches and the "load model" button
-        self.menu.append(ui.Button("Load Current Model", self.load_model))
-        self.menu.append(ui.Switch("new_window", self, label="Open detection in new window"))
-        self.menu.append(ui.Switch("sight_only", self, label="Only detect focused object"))
-        self.menu.append(ui.Switch("is_streaming", self, label="Stream at tcp://127.0.0.1:12001"))
-        self.menu.append(ui.Switch("export", self, label="Export data to local JSON and AVI"))
+    # --- UI -------------------------------------------------------------------------------
+    def init_ui(self):
+        self.add_menu()
+        self.menu.label = "Object Recognition (YOLO)"
         self.menu.append(ui.Info_Text(
-            "File will be saved at pupil_capture_settings/plugin/data."
+            "Detects and labels objects in the world camera. The object the participant is "
+            "looking at is drawn in red, the others in green. Object data is published on the "
+            "IPC backbone (topic \"objects\") and saved into the recording.\n"
+            "Requires the external detector: run `python yolo_server.py` in the Python 3.12 venv."
         ))
-        self.menu.append(ui.Switch("activation_state", self, label="Launch object recognition"))
-        self.menu.append(ui.Info_Text(str(self.fps)+" fps"
-       	))   
-        
-    # window calback
-    def on_resize(self, window, w, h):
-        active_window = glfwGetCurrentContext()
-        glfwMakeContextCurrent(window)
-        gl_utils.adjust_gl_view(w, h)
-        glfwMakeContextCurrent(active_window)
+        self.menu.append(ui.Text_Input("server_address", self, label="Detector address"))
+        self.menu.append(ui.Slider("conf", self, min=0.05, max=0.95, step=0.05,
+                                   label="Display confidence"))
+        self.menu.append(ui.Info_Text(
+            "Objects below this confidence are hidden from the overlay and ignored for the observed "
+            "object — but the detector still finds them and ALL detections (down to the detection "
+            "floor) are recorded, so nothing is lost."
+        ))
+        self.menu.append(ui.Slider("smooth", self, min=0.0, max=0.95, step=0.05,
+                                   label="Temporal smoothing"))
+        self.menu.append(ui.Info_Text(
+            "Higher smoothing = steadier contours but a touch more lag. Requires tracking "
+            "(on by default in the detector)."
+        ))
+        self.menu.append(ui.Slider("max_rate", self, min=1.0, max=30.0, step=1.0,
+                                   label="Max detection rate (Hz)"))
+        self.menu.append(ui.Info_Text(
+            "Caps inference rate; the overlay holds the last result between detections. Lower it "
+            "to steady the overlay or to save GPU on a weaker machine."
+        ))
+        self.menu.append(ui.Text_Input("classes_filter", self, label="Classes to display"))
+        self.menu.append(ui.Info_Text(
+            "Comma-separated class names to display (e.g. \"person, car, bus, traffic light\"). "
+            "Empty = show all. The detector keeps finding everything and all detections are still "
+            "recorded; this only filters the overlay and which objects can be the observed one."
+        ))
+        self.classes_text = ui.Info_Text("Seen classes: -")
+        self.menu.append(self.classes_text)
+        self.menu.append(ui.Switch("show_masks", self, label="Draw segmentation masks"))
+        self.menu.append(ui.Switch("show_ids", self, label="Show track ids"))
+        self.menu.append(ui.Switch("sight_only", self, label="Only observed object"))
+        self.menu.append(ui.Button("Reconnect detector", self.restart_client))
+        self.menu.append(ui.Switch("activation_state", self, label="Launch object recognition",
+                                   setter=self._toggle_activation))
+        self.status_text = ui.Info_Text("Detector: idle")
+        self.menu.append(self.status_text)
 
     def deinit_ui(self):
         self.remove_menu()
+        self.status_text = None
+        self.classes_text = None
 
-    
-    def load_model(self):
-    	# load the model based on which parameter we want.
-    	# there are many models available, check AlexeyAB/darknet on github for more
-
-        # global variables used to access darknet parameters
-        global metaMain, netMain, altNames
-        netMain = None
-        metaMain = None
-        altNames = None
-        if self.detect_mode=="Yolo 608 (best precision)":
-
-            # here you need to specify the path to darknet/x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            # configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4.cfg"
-            # weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            # metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 608
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-            # 608 is the image size needed for image detections with yolov4
-            # the right way to do it is :
-            # self.darknet_image = darknet.make_image(darknet.network_width(netMain), darknet.network_height(netMain),3)
-            # but it raise an access violation for us
-
-        elif self.detect_mode=="Yolo 512":
-
-            # here you need to specify the path to darknet\x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4_512.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 512
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-        elif self.detect_mode == "Yolo 416":
-
-            # here you need to specify the path to darknet/x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-416.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 416
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-
-        elif self.detect_mode == "Yolo 320":
-
-            # here you need to specify the path to darknet/x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-320.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 320
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-        elif self.detect_mode=="Yolo Tiny (fastest)":
-
-            # here you need to specify the path to darknet\x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-tiny.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4-tiny.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 416
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-            # 416 is the image size needed for image detections with yolov4-tiny
-            # the right way to do it is :
-            # self.darknet_image = darknet.make_image(darknet.network_width(netMain), darknet.network_height(netMain),3)
-            # but it raise an access violation for us
-
-        elif self.detect_mode=="Yolo Mish (RTX 2070)":
-
-            # here you need to specify the path to darknet\x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-mish-416.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4-mish-416.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 416
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-        elif self.detect_mode=="Yolo SAM Mish 512":
-
-            # here you need to specify the path to darknet\x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-sam-mish.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4-sam-mish.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 512
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-        elif self.detect_mode=="Yolo Leaky (GTX 1080ti)":
-
-            # here you need to specify the path to darknet\x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-leaky-416.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4-leaky-416.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 416
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
-        elif self.detect_mode=="Custom":
-            # here you need to specify the path to darknet/x64 directory and cfg, weight, data files
-            configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4-self.cfg"
-            weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4-self_13000.weights"
-            metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/self.data"
-
-            # configPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/yolov4.cfg"
-            # weightPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/yolov4.weights"
-            # metaPath = "C:/Users/"+USER+"/pupil_capture_settings/plugins/darknet/build/darknet/x64/cfg/coco.data"
-
-            self.network_image_size = 608
-            self.darknet_image = make_image(self.network_image_size, self.network_image_size, 3)
-
+    def _toggle_activation(self, value):
+        self.activation_state = value
+        if value:
+            self.start_client()
         else:
-            print("Error : No model loaded.")
-            raise ValueError("No model loaded.")
+            self.stop_client()
 
-        if not os.path.exists(configPath):
-            raise ValueError("Invalid config path `" +
-                             os.path.abspath(configPath) + "`")
-        if not os.path.exists(weightPath):
-            raise ValueError("Invalid weight path `" +
-                             os.path.abspath(weightPath) + "`")
-        if not os.path.exists(metaPath):
-            raise ValueError("Invalid data file path `" +
-                             os.path.abspath(metaPath) + "`")
-        if netMain is None:
-            netMain = load_net_custom(configPath.encode(
-                "ascii"), weightPath.encode("ascii"), 0, 1)  # batch size = 1
-        if metaMain is None:
-            metaMain = load_meta(metaPath.encode("ascii"))
-        if altNames is None:
-            try:
-                with open(metaPath) as metaFH:
-                    metaContents = metaFH.read()
-                    import re
-                    match = re.search("names *= *(.*)$", metaContents,
-                                      re.IGNORECASE | re.MULTILINE)
-                    if match:
-                        result = match.group(1)
-                    else:
-                        result = None
-                    try:
-                        if os.path.exists(result):
-                            with open(result) as namesFH:
-                                namesList = namesFH.read().strip().split("\n")
-                                altNames = [x.strip() for x in namesList]
-                    except TypeError:
-                        pass
-            except Exception:
-                pass
-        self.model_loaded = True
+    # --- detector client lifecycle --------------------------------------------------------
+    def start_client(self):
+        if self.client is None:
+            self.client = DetectorClient(self.server_address)
+            self.client.start()
+            self._last_submit = 0.0
 
-    def cvDrawBoxes(self, detections, img):
-        '''
-        draw boxes and labels around objects
-        :param detections: lists of objects detected, each object is also a list of class name,
-         x position, y position, width and height of the box around it.
-        :param img: the current img after detection
-        :return: modified image
-        '''
-        self.focus_object_index=-1
-        for detection in detections:
-            x, y, w, h = detection[2][0], \
-                         detection[2][1], \
-                         detection[2][2], \
-                         detection[2][3]
+    def stop_client(self):
+        if self.client is not None:
+            self.client.stop()
+            self.client = None
 
-            # compute the coordinates of the box from yx,y,w and h
-            xmin, ymin, xmax, ymax = convertBack(
-                float(x), float(y), float(w), float(h))
+    def restart_client(self):
+        self.stop_client()
+        if self.activation_state:
+            self.start_client()
 
-            # rescale the size of the box from the size of the darknet image to the world camera image
-            self.width, self.height = self.g_pool.capture.frame_size
-            xmin = int(xmin * self.width / self.network_image_size)
-            xmax = int(xmax * self.width / self.network_image_size)
-            ymax = int(ymax * self.height / self.network_image_size)
-            ymin = int(ymin * self.height / self.network_image_size)
-            #print("x : "+str(xmin)+", "+str(xmax))
-            #print("y : " + str(ymin) + ", " + str(ymax))
-            #print(self.gaze_position_2d)
-            if len(self.gaze_position_2d) != 0:
-                if self.sight_only:
-                    if xmin < self.gaze_position_2d[0] < xmax and ymin < self.gaze_position_2d[1] < ymax:
-                        # create points to draw the rectangle and the text only if they are in sight and in red
-                        pt1 = (xmin, ymin)
-                        pt2 = (xmax, ymax)
-                        cv2.rectangle(img, pt1, pt2, self.color["red"], 1)
-                        cv2.putText(img,
-                                    detection[0].decode() +
-                                    " [" + str(round(detection[1] * 100, 2)) + "]",
-                                    (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    self.color["red"], 2)
-                        self.focus_object_index = detections.index(detection)
-                else:
-                    if xmin < self.gaze_position_2d[0] < xmax and ymin < self.gaze_position_2d[1] < ymax:
-                        # create points to draw the rectangle and the text in red if they are in sight
-                        pt1 = (xmin, ymin)
-                        pt2 = (xmax, ymax)
-                        cv2.rectangle(img, pt1, pt2, self.color["red"], 1)
-                        cv2.putText(img,
-                                    detection[0].decode() +
-                                    " [" + str(round(detection[1] * 100, 2)) + "]",
-                                    (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    self.color["red"], 2)
-                        # store the index of the object in focus
-                        self.focus_object_index = detections.index(detection)
-                    else:
-                        # create points to draw the rectangle and the text in green if not in sight
-                        pt1 = (xmin, ymin)
-                        pt2 = (xmax, ymax)
-                        cv2.rectangle(img, pt1, pt2, self.color["blue"], 1)
-                        cv2.putText(img,
-                                    detection[0].decode() +
-                                    " [" + str(round(detection[1] * 100, 2)) + "]",
-                                    (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    self.color["blue"], 2)
-            else:
-                    # create points to draw the rectangle and the text in green(#5AA333) if no gaze data is gathered
-                    pt1 = (xmin, ymin)
-                    pt2 = (xmax, ymax)
-                    cv2.rectangle(img, pt1, pt2, self.color["blue"], 1)
-                    cv2.putText(img,
-                                detection[0].decode() +
-                                " [" + str(round(detection[1] * 100, 2)) + "]",
-                                (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                self.color["blue"], 2)
-                    #print("No Gaze data, try calibrating to get focused object")
-        return img
+    # --- recording hooks ------------------------------------------------------------------
+    def on_notify(self, notification):
+        subject = notification.get("subject", "")
+        if subject == "recording.started":
+            self._open_writer(notification.get("rec_path"))
+        elif subject == "recording.stopped":
+            self._close_writer()
 
-
-
-    def format_json(self, obj_datum, detections):
-        data = {}
-        if self.focus_object_index > 0:
-            obj = detections[self.focus_object_index]
-            name = obj[0].decode('utf-8')
-            #print(name)
-            data[name] = obj[2]
-            obj_datum["objects"] = data
-        return obj_datum
-
-    def export_data_json(self, datum):
-        """
-      save JSON file to plugins/data/object_data.json
-      :param datum: JSON file
-      """
-        if self.focus_object_index > 0:
-            with open('C:/Users/' + USER + '/pupil_capture_settings/plugins/data/object_data.json', 'a',
-                  newline='') as file:
-                jstr = json.dumps(datum, indent=4) + '\n'
-                file.write(jstr)
-
-    def recent_events(self, events):
-        prev_time = time.time()  # used to show fps
-        events["objects"] = [] # creates the topic "objects" that will be used to export recognition data
-
-        if 'frame' in events:
-            frame = events['frame']
-        else:
+    def _open_writer(self, rec_path):
+        self._close_writer()
+        if PLData_Writer is None or not rec_path:
             return
-        # get current frame
-        self.img = frame.img
+        try:
+            self._writer = PLData_Writer(rec_path, "objects")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Could not open PLData_Writer: %s", exc)
+            self._writer = None
 
-        # get the gaze data from Pupil Core
+    def _close_writer(self):
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:  # pragma: no cover
+                pass
+            self._writer = None
+
+    # --- per-frame processing -------------------------------------------------------------
+    def recent_events(self, events):
+        t_prev = time.time()
+        events["objects"] = []
+
+        frame = events.get("frame")
+        if frame is None:
+            return
+        self.img = frame.img
+        self.height, self.width = self.img.shape[:2]
+
+        # Gaze in pixel coordinates (norm_pos has the y axis flipped vs. the image).
         gaze = events.get("gaze", [])
         try:
-        	self.gaze_position_2d = list(gaze[0].get('norm_pos')) # "norm_pos" returns the gaze position in the normalized plane of the image.
-        	self.gaze_position_2d[0] = self.gaze_position_2d[0] * self.width
-        	self.gaze_position_2d[1] = (1-self.gaze_position_2d[1]) * self.height
-        except IndexError: # if you don't calibrate the Pupil Core, gaze will be empty and it raises an IndexError.
-        	self.gaze_position_2d = []
-        
-        # print(self.gaze_position_2d)
-        # the vector base of this plane is the same as Yolo's vector base except that the y axis is inverted
-        # therefore we need to convert back the normalized position and then rescale it with our image dimensions
-        
-        if self.activation_state:
-            if self.model_loaded:
-                # resize frame to right size for prediction
-                frame_resized = cv2.resize(self.img,
-                                           (network_width(netMain),
-                                            network_height(netMain)),
-                                           interpolation=cv2.INTER_LINEAR)
-                copy_image_from_bytes(self.darknet_image, frame_resized.tobytes())  # transform the current frame ina darknet compatible format
-                detections = detect_image(netMain, metaMain, self.darknet_image, thresh=0.25)  # Yolo is used here to detect objects
-                image = self.cvDrawBoxes(detections=detections, img=self.img)   # draw boxes around objects
-                self.img = image  # display in Pupil Capture
-                '''
-                Export objects classes and box coordinates with their associated timestamps and coordinates in the topic "objects"
-                We only export recognition data when the subject is focusing on an object. if no object is being watch, nothing happends.
-                '''
-                if self.focus_object_index > 0:
-                    obj_entry = {
-                        'topic': "objects",
-                        'timestamp': self.g_pool.get_timestamp(),
-                        'mode': self.detect_mode
-                    }
+            norm = gaze[0]["norm_pos"]
+            self.gaze_position_2d = [norm[0] * self.width, (1.0 - norm[1]) * self.height]
+        except (IndexError, KeyError, TypeError):
+            self.gaze_position_2d = []
 
-                    obj_entry = self.format_json(obj_entry, detections=detections) # create JSON format string
-                    events["objects"].append(obj_entry) # add the object data to "objects" topic
-                    self.data = events["objects"] # getting back the data to use it, it allow to check if everything is fine
+        if not self.activation_state or self.client is None:
+            self._update_status()
+            return
 
-        # local .avi video exportation
-        if self.export:
-            if self.out is None:
-                self.out = cv2.VideoWriter('C:/Users/' + USER + '/pupil_capture_settings/plugins/data/output.avi', self.codec, 24.0, (1280, 720))
-            self.out.write(self.img)  # write local .avi video
-            self.export_data_json(datum=self.data) # write local JSON file
-        else:
-            if self.out is not None:
-                self.out.release()
+        # Hand the current frame to the worker (throttled to max_rate) and overlay the latest
+        # available result. Between submissions the held result keeps the overlay steady.
+        now = time.time()
+        min_period = 1.0 / self.max_rate if self.max_rate > 0 else 0.0
+        if now - self._last_submit >= min_period:
+            self.client.submit(self.img.copy(), {"conf": self.detect_floor, "smooth": self.smooth})
+            self._last_submit = now
+        result = self.client.get_result()
+        detections = result.get("detections", []) if result else []
 
-        '''
-        Stream the current frame at tcp://127.0.0.1:12001 but you can change ip and port in self.__init__().
-        It sends JPG images but you can change the format if needed. 
-        '''
-        if self.is_streaming:
-            if self.sender is None:
-                self.sender = imagezmq.ImageSender(connect_to="tcp://{}:{}".format(self.SERVER_IP, self.SERVER_PORT), REQ_REP=False)
-                print('Connect the ImageSender object to {}:{}'.format(self.SERVER_IP, self.SERVER_PORT))
-                print('Host name is {}'.format(self.HOST_NAME))
-            _, jpg_buffer = cv2.imencode(".jpg", self.img)
-            self.sender.send_jpg(self.HOST_NAME, jpg_buffer)
-        else:
-            if self.sender is not None:
-                self.sender.close() # close the stream when the switch is off
-            self.sender = None
+        # Parse the display whitelist and track which object classes we've seen (for discovery).
+        self._whitelist = frozenset(
+            c.strip().lower() for c in self.classes_filter.split(",") if c.strip())
+        for det in detections:
+            if det.get("kind") != "layer":
+                self._seen_classes.add(det["name"])
 
-        # detection fps indicator
-        total_time = time.time()-prev_time
-        self.menu.elements.pop()
-        self.fps = int((1 / total_time)*100)/100
-        self.menu.append(ui.Info_Text(str(self.fps) + " fps"
-        ))
-        
-        if self.new_window: # if you prefer to open the detection in a new window
-            if self.img is not None:
-                cv2.imshow('Demo', self.img)
-                cv2.waitKey(3)
+        focus_idx = self._find_observed(detections)
+        self._draw_overlay(detections, focus_idx)
 
-    def gl_display(self):
+        datum = self._build_datum(frame, detections, focus_idx)
+        if datum is not None:
+            events["objects"].append(datum)
+            self._publish(datum)
+            if self._writer is not None:
+                try:
+                    self._writer.append(datum)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("PLData append failed: %s", exc)
+
+        dt = time.time() - t_prev
+        if dt > 0:
+            self._draw_fps = 0.8 * self._draw_fps + 0.2 * (1.0 / dt)
+        self._update_status()
+
+    def _visible(self, name):
+        """Whether an object class is in the display whitelist (empty whitelist = all)."""
+        return not self._whitelist or name.lower() in self._whitelist
+
+    def _show_object(self, det):
+        """Object passes the display filters: class whitelist AND confidence threshold.
+
+        Display-only: every detection is still recorded (down to the detection floor); this just
+        controls what is drawn and what can be the observed object.
         """
-        This is where we can draw to any gl surface
-        by default this is the main window, below we change that
+        return self._visible(det.get("name", "")) and det.get("conf", 1.0) >= self.conf
+
+    def _find_observed(self, detections):
+        """Return the index of the smallest *object* containing the gaze point, or -1.
+
+        Semantic layers (road, lanes...) are skipped: the gaze is almost always on the road, so it
+        would never leave it. Only instance objects are eligible to be "observed".
         """
+        if not self.gaze_position_2d or not detections:
+            return -1
+        gx, gy = self.gaze_position_2d
+        best_idx, best_area = -1, None
+        for i, det in enumerate(detections):
+            if det.get("kind") == "layer" or not self._show_object(det):
+                continue
+            mask = det.get("mask")
+            inside = False
+            area = None
+            if mask is not None and len(mask) >= 3:
+                contour = np.array(mask, dtype=np.int32).reshape(-1, 1, 2)
+                if cv2.pointPolygonTest(contour, (float(gx), float(gy)), False) >= 0:
+                    inside = True
+                    area = abs(cv2.contourArea(contour))
+            else:
+                x1, y1, x2, y2 = det["box"]
+                if x1 <= gx <= x2 and y1 <= gy <= y2:
+                    inside = True
+                    area = abs((x2 - x1) * (y2 - y1))
+            if inside and (best_area is None or area < best_area):
+                best_idx, best_area = i, area
+        return best_idx
 
-        # active our window
-        #active_window = glfwGetCurrentContext()
-        #glfwMakeContextCurrent(self.window)
+    def _draw_overlay(self, detections, focus_idx):
+        img = self.img
+        # Semantic layers first (translucent fills), so objects/labels draw on top.
+        for det in detections:
+            if det.get("kind") != "layer":
+                continue
+            mask = det.get("mask")
+            if not (self.show_masks and mask is not None and len(mask) >= 3):
+                continue
+            color = LAYER_COLORS.get(det["name"], LAYER_DEFAULT_COLOR)
+            contour = np.array(mask, dtype=np.int32).reshape(-1, 1, 2)
+            overlay = img.copy()
+            cv2.fillPoly(overlay, [contour], color)
+            cv2.addWeighted(overlay, LAYER_ALPHA, img, 1.0 - LAYER_ALPHA, 0, img)
+            cv2.polylines(img, [contour], True, color, 1)
 
-        # start drawing things:
-        gl_utils.clear_gl_screen()
-        # set coordinate system to be between 0 and 1 of the extents of the window
-        gl_utils.make_coord_system_norm_based()
-        # draw the image
+        # Instance objects (gaze-coloured).
+        for i, det in enumerate(detections):
+            if det.get("kind") == "layer" or not self._show_object(det):
+                continue
+            if self.sight_only and i != focus_idx:
+                continue
+            color = COLOR_OBSERVED if i == focus_idx else COLOR_OTHER
+            x1, y1, x2, y2 = (int(v) for v in det["box"])
+            mask = det.get("mask")
+            if self.show_masks and mask is not None and len(mask) >= 3:
+                contour = np.array(mask, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(img, [contour], True, color, 2)
+            else:
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            label = "{} [{:.0f}%]".format(det["name"], det["conf"] * 100)
+            if self.show_ids:
+                # "#-" means the detector returned no track id (running without tracking?).
+                tid = det.get("id")
+                label = "#{} {}".format(tid if tid is not None else "-", label)
+            cv2.putText(img, label, (x1, max(y1 - 5, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def _build_datum(self, frame, detections, focus_idx):
+        if not detections:
+            return None
+        focus = None
+        if focus_idx >= 0:
+            d = detections[focus_idx]
+            focus = {"id": d.get("id"), "name": d["name"], "conf": d["conf"],
+                     "box": d["box"], "mask": d.get("mask")}
+        return {
+            "topic": "objects",
+            "timestamp": frame.timestamp,
+            "frame_index": frame.index,
+            "gaze_2d": list(self.gaze_position_2d) if self.gaze_position_2d else None,
+            "focus": focus,
+            "objects": [{"id": d.get("id"), "kind": d.get("kind", "object"), "engine": d.get("engine"),
+                         "name": d["name"], "conf": d["conf"], "box": d["box"]}
+                        for d in detections],
+        }
+
+    def _publish(self, datum):
+        ipc_pub = getattr(self.g_pool, "ipc_pub", None)
+        if ipc_pub is None:
+            return
         try:
-        	draw_gl_texture(self.img)
-        	gl_utils.make_coord_system_pixel_based(self.img.shape)
-        except AttributeError:
-        	pass
-        # make coordinate system identical to the img pixel coordinate system
+            ipc_pub.send(datum)
+        except Exception as exc:  # pragma: no cover - API guard
+            logger.debug("ipc_pub.send failed: %s", exc)
 
-        # draw some points on top of the image
-        # notice how these show up in our window but not in the main window
-        # draw_points([(200, 400), (600, 400)], color=RGBA(0., 4., .8, .8), size=self.my_var)
-        # draw_polyline([(200, 400), (600, 400)], color=RGBA(0., 4., .8, .8), thickness=3)
+    def _update_status(self):
+        if self.classes_text is not None:
+            seen = sorted(self._seen_classes)
+            shown = ", ".join(seen[:18]) + (" ..." if len(seen) > 18 else "")
+            self.classes_text.text = "Seen classes: " + (shown if seen else "-")
+        if self.status_text is None:
+            return
+        if self.client is None:
+            self.status_text.text = "Detector: idle"
+            return
+        if self.client.connected:
+            self.status_text.text = "Detector: connected — infer {:.1f} Hz / plugin {:.1f} Hz".format(
+                self.client.infer_fps, self._draw_fps)
+        else:
+            err = self.client.last_error or "no response"
+            self.status_text.text = "Detector: DISCONNECTED ({}) — is yolo_server.py running?".format(err)
 
-        # since this is our own window we need to swap buffers in the plugin
-        #glfwSwapBuffers(self.window)
+    # --- GL display -----------------------------------------------------------------------
+    def gl_display(self):
+        gl_utils.clear_gl_screen()
+        gl_utils.make_coord_system_norm_based()
+        try:
+            draw_gl_texture(self.img)
+            gl_utils.make_coord_system_pixel_based(self.img.shape)
+        except (AttributeError, TypeError):
+            pass
 
-        # and finally reactive the main window
-        #glfwMakeContextCurrent(active_window)
-
+    # --- persistence / teardown -----------------------------------------------------------
     def get_init_dict(self):
-        # anything vars we want to be persistent accross sessions need to show up in the __init__
-        # and identically as a dict entry below:
-        return {'my_persistent_var': self.my_var}
+        return {
+            "server_address": self.server_address,
+            "conf": self.conf,
+            "smooth": self.smooth,
+            "max_rate": self.max_rate,
+            "detect_floor": self.detect_floor,
+            "sight_only": self.sight_only,
+            "show_masks": self.show_masks,
+            "show_ids": self.show_ids,
+            "classes_filter": self.classes_filter,
+        }
 
     def cleanup(self):
-        """ called when the plugin gets terminated.
-        This happens either voluntarily or forced.
-        if you have a GUI or glfw window destroy it here.
-        """
-        if self.out is not None:
-            self.out.release()
-        self.export_data_json(datum=self.data)
-        #glfwDestroyWindow(self.window)
+        self.stop_client()
+        self._close_writer()

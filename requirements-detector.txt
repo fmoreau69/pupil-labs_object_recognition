@@ -1,0 +1,15 @@
+# External YOLO detector process — Python 3.12 venv
+#
+# Install the CUDA build of torch FIRST (otherwise the CPU build gets pulled on Windows):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# then:
+#   pip install -r requirements-detector.txt
+
+ultralytics>=8.3
+pyzmq
+msgpack
+numpy
+opencv-python
+
+# torch / torchvision are installed separately (CUDA index URL above).
+# pylsl  -> added in phase 3 (LSL streaming)

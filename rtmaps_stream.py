@@ -5,7 +5,7 @@ import cv2
 import argparse
 import numpy as np
 import imagezmq
-from rtmaps.base_component import BaseComponent # base class
+from rtmaps.base_component import BaseComponent  # base class
 import rtmaps.core as rt
 import rtmaps.reading_policy
 from PIL import Image
@@ -14,7 +14,7 @@ from PIL import Image
 # Python class that will be called from RTMaps.
 class rtmaps_python(BaseComponent):
     def __init__(self):
-        BaseComponent.__init__(self) # call base class constructor
+        BaseComponent.__init__(self)  # call base class constructor
         self.force_reading_policy(rtmaps.reading_policy.SAMPLING)
         self.SERVER_PORT = 12001
         self.server_port = self.SERVER_PORT
@@ -23,6 +23,7 @@ class rtmaps_python(BaseComponent):
         # Add properties
         #self.add_property("IP", '127.0.0.1')    # If you talk to a different machine use its IP.
         #self.add_property("Port", 5555)    # The port defaults to 5555.
+
     # All inputs, outputs and properties MUST be created in the
     # Dynamic() function.
     def Dynamic(self):

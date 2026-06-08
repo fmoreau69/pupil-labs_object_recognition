@@ -1,5 +1,2 @@
-python 3.7
-cuda 10.2
 numpy
-cudnn 7.6.5 for cuda 10.2
-opencv 4.1.0
+opencv-python
