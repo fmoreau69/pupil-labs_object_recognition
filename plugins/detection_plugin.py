@@ -232,7 +232,7 @@ class Object_Recognition_YOLO(Plugin):
             "Detects and labels objects in the world camera. The object the participant is "
             "looking at is drawn in red, the others in green. Object data is published on the "
             "IPC backbone (topic \"objects\") and saved into the recording.\n"
-            "Requires the external detector: run `python yolo_server.py` in the Python 3.12 venv."
+            "Requires the external detector: run `python detector/yolo_server.py` in the Python 3.12 venv."
         ))
         self.menu.append(ui.Text_Input("server_address", self, label="Detector address"))
         self.menu.append(ui.Slider("conf", self, min=0.05, max=0.95, step=0.05,

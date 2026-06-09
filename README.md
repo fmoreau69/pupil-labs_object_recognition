@@ -67,7 +67,7 @@ Install the **CUDA** build of torch *first* (otherwise pip pulls the CPU build o
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install -r requirements-detector.txt
+pip install -r detector/requirements-detector.txt
 ```
 
 Check the GPU is visible:
@@ -77,15 +77,28 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 
 ### 2. Plugins (just copy one file each)
 
-- **Capture** → copy `detection_plugin.py` into `~/pupil_capture_settings/plugins/`
-- **Player**  → copy `player_object_recognition.py` into `~/pupil_player_settings/plugins/`
+- **Capture** → copy `plugins/detection_plugin.py` into `~/pupil_capture_settings/plugins/`
+- **Player**  → copy `plugins/player_object_recognition.py` into `~/pupil_player_settings/plugins/`
 
 (`~` is your home folder, e.g. `C:\Users\<you>\`.)
 
 ### 3. Optional — multi-sensor export
 
-- **RTMaps**: put `rtmaps_stream.py` in an RTMaps Python block.
-- **LSL**: in the detector venv, `pip install -r requirements-relay.txt` (adds `pylsl`).
+- **RTMaps**: put `integrations/rtmaps_stream.py` (data) and/or `integrations/rtmaps_video.py`
+  (annotated video) in an RTMaps Python block.
+- **LSL**: in the detector venv, `pip install -r integrations/requirements-relay.txt` (adds `pylsl`).
+
+---
+
+## Repository layout
+
+```
+plugins/        detection_plugin.py, player_object_recognition.py   ← single-file drop-ins
+detector/       yolo_server.py, engines.py, requirements-detector.txt
+integrations/   rtmaps_stream.py, rtmaps_video.py, lsl_relay.py, requirements-relay.txt
+                RTMaps/   example RTMaps acquisition diagrams (.rtd)
+models/         downloaded model weights (git-ignored)
+```
 
 ---
 
@@ -94,10 +107,10 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 ### Start the detector
 
 ```powershell
-python yolo_server.py                       # segmentation (yolo11n-seg), default
-python yolo_server.py --model yolo11n.pt    # detection only (lighter, e.g. weaker laptop)
+python detector/yolo_server.py                       # segmentation (yolo11n-seg), default
+python detector/yolo_server.py --model yolo11n.pt    # detection only (lighter, e.g. weaker laptop)
 ```
-Leave it running. The model file (~6 MB) downloads automatically on first launch.
+Leave it running. The weights (~6 MB) download into `models/` automatically on first launch.
 
 ### Pupil Capture
 
@@ -137,19 +150,23 @@ Open a recording with **Object Recognition (YOLO) — Player** enabled:
 Enable **Stream object data (RTMaps/LSL)** in the Capture plugin (bind address `tcp://*:5561`
 exposes it on the LAN; `tcp://127.0.0.1:5561` is localhost only). Then:
 
-- **RTMaps**: set the `rtmaps_stream.py` block's `sub_address` to `tcp://<pupil-host>:5561`. Outputs:
-  observed name/id/box, gaze, object count, Pupil timestamp, full JSON.
-- **LSL**: `python lsl_relay.py --connect tcp://<pupil-host>:5561`. Creates two LSL outlets —
+- **RTMaps**: set the `integrations/rtmaps_stream.py` block's `sub_address` to
+  `tcp://<pupil-host>:5561`. Outputs: observed name/id/box, gaze, object count, timestamp, JSON.
+- **LSL**: `python integrations/lsl_relay.py --connect tcp://<pupil-host>:5561`. Creates two LSL outlets —
   `PupilObjects` (numeric: `observed, x1, y1, x2, y2, gaze_x, gaze_y`) and `PupilObjects_json`
   (full datum as a string marker) — recordable in LabRecorder.
 
 **Annotated video** (overlay burned in) — enable **Stream annotated video (RTMaps)** and/or
 **Record annotated video**:
 
-- **RTMaps**: set the `rtmaps_video.py` block's `sub_address` to `tcp://<pupil-host>:5562` to view
-  the overlaid world camera live in RTMaps.
+- **RTMaps**: set the `integrations/rtmaps_video.py` block's `sub_address` to
+  `tcp://<pupil-host>:5562` to view the overlaid world camera live in RTMaps.
 - **File**: with a Pupil recording running, `world_overlay.mp4` is written into the recording
   folder. (For Player you usually don't need it — the overlay is rebuilt from `objects.pldata`.)
+
+Example RTMaps diagrams live in `integrations/RTMaps/`. Their PythonBridge `pythonFilename` still
+points at old absolute paths — repoint it to `integrations/rtmaps_video.py` (annotated video) or
+`integrations/rtmaps_stream.py` (object data) when you open them.
 
 > **Offline note**: LSL/RTMaps are *live* sync transports. If you detect only in post-processing,
 > use `objects.pldata` / `objects.csv` and merge with your live LSL/XDF + RTMaps logs **by
@@ -179,14 +196,14 @@ region like road/lane).
 Run several at once with `--engines` (merged into one overlay):
 
 ```powershell
-python yolo_server.py --engines yolo,yolopv2 --yolopv2-model path\to\yolopv2.pt
-python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
+python detector/yolo_server.py --engines yolo,yolopv2 --yolopv2-model models/yolopv2.pt
+python detector/yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
 ```
 
 | Engine | Output | Real-time | Needs |
 |---|---|:--:|---|
 | `yolo` | objects + masks, tracking | ✅ | ultralytics (installed) |
-| `yolopv2` | drivable-area + lane layers | ✅ | `yolopv2.pt` (TorchScript) |
+| `yolopv2` | drivable-area + lane layers | ✅ | `models/yolopv2.pt` (TorchScript) |
 | `sam3` | text-prompt masks | ❌ (offline) | `sam3` pkg + gated HF `facebook/sam3` |
 
 SAM3 is offline-grade on Windows (its video predictor needs Linux/`triton`) — use it in Player.
@@ -195,7 +212,7 @@ SAM3 is offline-grade on Windows (its video predictor needs Linux/`triton`) — 
 
 ## Troubleshooting
 
-- **"Detector: DISCONNECTED"** → start `python yolo_server.py`; check the **Detector address**.
+- **"Detector: DISCONNECTED"** → start `python detector/yolo_server.py`; check the **Detector address**.
 - **Track ids show `#-`** → the detector isn't tracking; restart it (tracking is on by default,
   don't pass `--no-track`).
 - **Overlay too jittery** → raise **Temporal smoothing** (0.6–0.8) and/or lower **Max detection rate**.

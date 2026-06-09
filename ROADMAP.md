@@ -86,9 +86,9 @@ post-traitement Pupil Player, ou à très basse fréquence en Capture.
 
 ### Lancer le serveur
 ```powershell
-python yolo_server.py                                    # yolo seg (défaut)
-python yolo_server.py --engines yolo,yolopv2 --yolopv2-model path\to\yolopv2.pt
-python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
+python detector/yolo_server.py                           # yolo seg (défaut)
+python detector/yolo_server.py --engines yolo,yolopv2 --yolopv2-model models/yolopv2.pt
+python detector/yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
 ```
 
 ---
@@ -174,16 +174,18 @@ partir des données objets horodatées.
 
 ## Découpage des fichiers
 
-| Fichier                      | Env    | Rôle                                                       |
-|------------------------------|:------:|------------------------------------------------------------|
-| `yolo_server.py` + `engines.py` | 3.12 | Serveur ZMQ REP multi-moteurs : frame → détections/masques |
-| `detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
-| `player_object_recognition.py` | 3.6  | Plugin Pupil Player (relecture + retraitement offline)     |
-| `rtmaps_stream.py`           | RTMaps | Réception ZMQ côté RTMaps (pyzmq nu) → données objet        |
-| `rtmaps_video.py`            | RTMaps | Réception ZMQ côté RTMaps → vidéo annotée (IPL_IMAGE)       |
-| `lsl_relay.py`               | 3.12   | Relais ZMQ→LSL (outlets numérique + JSON) pour synchro multi-capteurs |
-| `requirements-detector.txt` / `requirements-relay.txt` | 3.12 | Dépendances venv détecteur / relais LSL          |
-| `~Archives/`                 | —      | `darknet`, `imagezmq`, ancien plugin (nettoyage versionning ultérieur) |
+| Fichier                              | Env    | Rôle                                                  |
+|--------------------------------------|:------:|-------------------------------------------------------|
+| `detector/yolo_server.py` + `engines.py` | 3.12 | Serveur ZMQ REP multi-moteurs : frame → détections/masques |
+| `plugins/detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
+| `plugins/player_object_recognition.py` | 3.6  | Plugin Pupil Player (relecture + retraitement offline)|
+| `integrations/rtmaps_stream.py`      | RTMaps | Réception ZMQ côté RTMaps (pyzmq nu) → données objet   |
+| `integrations/rtmaps_video.py`       | RTMaps | Réception ZMQ côté RTMaps → vidéo annotée (IPL_IMAGE)  |
+| `integrations/lsl_relay.py`          | 3.12   | Relais ZMQ→LSL (outlets numérique + JSON) pour synchro multi-capteurs |
+| `integrations/RTMaps/`               | RTMaps | Diagrammes d'acquisition RTMaps d'exemple (`.rtd`)    |
+| `detector/requirements-detector.txt` / `integrations/requirements-relay.txt` | 3.12 | Dépendances venv détecteur / relais LSL |
+| `models/`                            | —      | Cache des poids modèles téléchargés (git-ignored)     |
+| `~Archives/`                         | —      | `darknet`, `imagezmq`, ancien plugin (nettoyage versionning ultérieur) |
 
 ---
 
@@ -194,17 +196,18 @@ partir des données objets horodatées.
    py -3.12 -m venv .venv
    .\.venv\Scripts\Activate.ps1
    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-   pip install -r requirements-detector.txt
+   pip install -r detector/requirements-detector.txt
    ```
 2. **Plugins** :
-   - Capture : copier `detection_plugin.py` dans `~/pupil_capture_settings/plugins/`.
-   - Player : copier `player_object_recognition.py` dans `~/pupil_player_settings/plugins/`.
-3. **Lancement** : démarrer `python yolo_server.py` puis Pupil Capture/Player ; activer le plugin
-   « Object Recognition (YOLO) » dans le Plugin Manager.
+   - Capture : copier `plugins/detection_plugin.py` dans `~/pupil_capture_settings/plugins/`.
+   - Player : copier `plugins/player_object_recognition.py` dans `~/pupil_player_settings/plugins/`.
+3. **Lancement** : démarrer `python detector/yolo_server.py` puis Pupil Capture/Player ; activer le
+   plugin « Object Recognition (YOLO) » dans le Plugin Manager.
    - Player : si le recording contient déjà `objects.pldata` → relecture auto de l'overlay ; sinon
      bouton **Reprocess recording** (détecteur lancé) pour le générer.
 4. **Export multi-capteurs** (optionnel) : dans le plugin Capture, activer « Stream object data
    (RTMaps/LSL) ». Puis :
-   - **RTMaps** : `rtmaps_stream.py` dans un bloc Python RTMaps (propriété `sub_address`).
-   - **LSL** : `pip install -r requirements-relay.txt` puis `python lsl_relay.py`
-     (`--connect tcp://<hôte_pupil>:5561`) ; les flux apparaissent dans LabRecorder.
+   - **RTMaps** : `integrations/rtmaps_stream.py` dans un bloc Python RTMaps (propriété `sub_address`).
+   - **LSL** : `pip install -r integrations/requirements-relay.txt` puis
+     `python integrations/lsl_relay.py` (`--connect tcp://<hôte_pupil>:5561`) ; les flux apparaissent
+     dans LabRecorder.

@@ -19,12 +19,13 @@ Wire protocol (msgpack, one request -> one reply):
                "shape": [h, w], "engines": [str, ...], "task": str}
 
 Usage:
-    python yolo_server.py                                   # yolo seg (default)
-    python yolo_server.py --engines yolo,yolopv2            # objects + road/lane layers
-    python yolo_server.py --engines yolopv2 --yolopv2-model path/to/yolopv2.pt
-    python yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
+    python detector/yolo_server.py                              # yolo seg (default)
+    python detector/yolo_server.py --engines yolo,yolopv2       # objects + road/lane layers
+    python detector/yolo_server.py --engines yolopv2 --yolopv2-model models/yolopv2.pt
+    python detector/yolo_server.py --engines sam3 --sam3-road "drivable road surface in front of the vehicle"
 """
 import argparse
+import os
 import time
 
 import cv2
@@ -33,6 +34,17 @@ import numpy as np
 import zmq
 
 from engines import TemporalSmoother, build_engines
+
+# Default weights cache: <repo>/models (this file lives in <repo>/detector).
+_MODELS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models"))
+
+
+def resolve_model(name, models_dir):
+    """Cache bare model names under models_dir; leave explicit paths untouched."""
+    if not name or os.path.dirname(name):
+        return name
+    os.makedirs(models_dir, exist_ok=True)
+    return os.path.join(models_dir, name)
 
 
 def parse_args():
@@ -44,6 +56,8 @@ def parse_args():
     p.add_argument("--conf", type=float, default=0.25, help="Default confidence threshold (yolo)")
     p.add_argument("--device", default=None, help="'0' (GPU), 'cpu' (default: auto)")
     p.add_argument("--half", action="store_true", help="FP16 inference (GPU only)")
+    p.add_argument("--models-dir", default=_MODELS_DIR,
+                   help="Where to cache/download bare model names (default: <repo>/models)")
     # yolo
     p.add_argument("--model", default="yolo11n-seg.pt", help="Ultralytics model (yolo engine)")
     p.add_argument("--imgsz", type=int, default=640)
@@ -65,6 +79,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.model = resolve_model(args.model, args.models_dir)
+    args.yolopv2_model = resolve_model(args.yolopv2_model, args.models_dir)
 
     engines = build_engines(args)
     engine_names = [e.name for e in engines]

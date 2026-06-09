@@ -14,7 +14,7 @@ Offline companion to the Capture plugin. Two modes:
      plugin, and is the right place for heavy/offline engines like SAM3.
 
 Runs in the Pupil Player bundle (Python 3.6); only deps already present are used: pyzmq, numpy,
-opencv, msgpack, pyglui. The external detector must be running (``python yolo_server.py``).
+opencv, msgpack, pyglui. The external detector must be running (``python detector/yolo_server.py``).
 """
 import glob
 import csv
@@ -105,7 +105,7 @@ class Object_Recognition_Player(Plugin):
         self.menu.append(ui.Info_Text(
             "Replays recorded object data (objects.pldata) over the world video. If the recording "
             "has none, use 'Reprocess' to run detection + gaze matching offline (needs the external "
-            "detector running: `python yolo_server.py`)."
+            "detector running: `python detector/yolo_server.py`)."
         ))
         self.menu.append(ui.Text_Input("classes_filter", self, label="Classes to display"))
         self.menu.append(ui.Info_Text("Comma-separated class names to display; empty = all."))
