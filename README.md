@@ -59,6 +59,24 @@ a separate **Python 3.12** process; the in-bundle plugin is a thin client.
 
 ## Installation
 
+### Quick install (Windows, recommended)
+
+With the Pupil Core bundle already installed and this repo cloned, just run the installer
+(double-click **`install.bat`**, or from PowerShell):
+
+```powershell
+.\install.ps1            # auto: detects the NVIDIA GPU and picks the right torch build
+.\install.ps1 -Cpu       # force the CPU build (laptop without an NVIDIA GPU)
+.\install.ps1 -NoServer  # install only, don't launch the detector at the end
+```
+
+It creates the `.venv`, **detects the GPU** (and warns about a CPU fallback if there's no NVIDIA
+card), installs the dependencies, copies both plugins into `~/pupil_capture_settings/plugins` and
+`~/pupil_player_settings/plugins` (creating the folders if Capture/Player were never launched), then
+starts the detector. Afterwards, start the detector any time with **`start_detector.bat`**.
+
+The manual steps below are equivalent, for reference or other platforms.
+
 ### 1. Detector (once, Python 3.12 venv)
 
 Install the **CUDA** build of torch *first* (otherwise pip pulls the CPU build on Windows):
@@ -93,6 +111,8 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 ## Repository layout
 
 ```
+install.bat / install.ps1   Windows one-shot installer (venv + deps + plugins + server)
+start_detector.bat          launch the detector later (reuses the .venv)
 plugins/        capture_object_recognition.py, player_object_recognition.py   ← single-file drop-ins
 detector/       yolo_server.py, engines.py, requirements-detector.txt
 integrations/   rtmaps_stream.py, rtmaps_video.py, lsl_relay.py, requirements-relay.txt
