@@ -23,7 +23,7 @@ l'objectif « installation simple ».
 
 ```
 ┌─ Pupil Capture (bundle, Python 3.6) ───────────────┐
-│  detection_plugin.py  — MINCE, 0 dépendance lourde  │
+│  capture_object_recognition.py — plugin Capture     │
 │   • recent_events : world frame + gaze              │
 │   • envoie la frame ──ZMQ──> détecteur              │
 │   • reçoit boxes / masques / labels <──ZMQ          │
@@ -177,7 +177,7 @@ partir des données objets horodatées.
 | Fichier                              | Env    | Rôle                                                  |
 |--------------------------------------|:------:|-------------------------------------------------------|
 | `detector/yolo_server.py` + `engines.py` | 3.12 | Serveur ZMQ REP multi-moteurs : frame → détections/masques |
-| `plugins/detection_plugin.py`        | 3.6    | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
+| `plugins/capture_object_recognition.py` | 3.6 | Plugin Pupil Capture mince (client ZMQ, gaze, overlay, IPC, export PUB) |
 | `plugins/player_object_recognition.py` | 3.6  | Plugin Pupil Player (relecture + retraitement offline)|
 | `integrations/rtmaps_stream.py`      | RTMaps | Réception ZMQ côté RTMaps (pyzmq nu) → données objet   |
 | `integrations/rtmaps_video.py`       | RTMaps | Réception ZMQ côté RTMaps → vidéo annotée (IPL_IMAGE)  |
@@ -199,7 +199,7 @@ partir des données objets horodatées.
    pip install -r detector/requirements-detector.txt
    ```
 2. **Plugins** :
-   - Capture : copier `plugins/detection_plugin.py` dans `~/pupil_capture_settings/plugins/`.
+   - Capture : copier `plugins/capture_object_recognition.py` dans `~/pupil_capture_settings/plugins/`.
    - Player : copier `plugins/player_object_recognition.py` dans `~/pupil_player_settings/plugins/`.
 3. **Lancement** : démarrer `python detector/yolo_server.py` puis Pupil Capture/Player ; activer le
    plugin « Object Recognition (YOLO) » dans le Plugin Manager.

@@ -35,7 +35,7 @@ a separate **Python 3.12** process; the in-bundle plugin is a thin client.
 
 ```
 ┌─ Pupil Capture / Player (bundle, Python 3.6) ─┐        ┌─ Detector (your venv, Python 3.12) ─┐
-│  detection_plugin.py / player_..._.py         │  ZMQ   │  yolo_server.py + engines.py        │
+│  capture_/player_object_recognition.py        │  ZMQ   │  yolo_server.py + engines.py        │
 │  • world frame + gaze                         │ ─────► │  • ultralytics YOLO (+track/smooth) │
 │  • overlay, gaze matching (red/green)         │ ◄───── │  • yolopv2 / sam3 (optional)        │
 │  • record objects.pldata + objects.csv        │        └─────────────────────────────────────┘
@@ -77,7 +77,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 
 ### 2. Plugins (just copy one file each)
 
-- **Capture** → copy `plugins/detection_plugin.py` into `~/pupil_capture_settings/plugins/`
+- **Capture** → copy `plugins/capture_object_recognition.py` into `~/pupil_capture_settings/plugins/`
 - **Player**  → copy `plugins/player_object_recognition.py` into `~/pupil_player_settings/plugins/`
 
 (`~` is your home folder, e.g. `C:\Users\<you>\`.)
@@ -93,7 +93,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 ## Repository layout
 
 ```
-plugins/        detection_plugin.py, player_object_recognition.py   ← single-file drop-ins
+plugins/        capture_object_recognition.py, player_object_recognition.py   ← single-file drop-ins
 detector/       yolo_server.py, engines.py, requirements-detector.txt
 integrations/   rtmaps_stream.py, rtmaps_video.py, lsl_relay.py, requirements-relay.txt
                 RTMaps/   example RTMaps acquisition diagrams (.rtd)
