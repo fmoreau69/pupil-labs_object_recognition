@@ -34,6 +34,11 @@
 .PARAMETER Recreate
     Delete and rebuild the .venv from scratch.
 
+.PARAMETER InstallPython
+    If no suitable Python (3.10-3.13) is found, install Python 3.12 automatically
+    (via winget, falling back to the python.org installer) without prompting.
+    Note: an existing Python 3.13 already works - 3.12 is only preferred, not required.
+
 .EXAMPLE
     .\install.ps1
 .EXAMPLE
@@ -45,7 +50,8 @@ param(
     [string]$Cuda = "cu126",
     [switch]$NoServer,
     [switch]$Force,
-    [switch]$Recreate
+    [switch]$Recreate,
+    [switch]$InstallPython
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,9 +88,50 @@ function Find-BasePython {
     return $null
 }
 
+function Install-Python312 {
+    # Try winget first (built into recent Windows 10/11), then fall back to the
+    # python.org offline installer. Per-user scope -> no admin prompt.
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Info "Installing Python 3.12 via winget (per-user)..."
+        & winget install -e --id Python.Python.3.12 --scope user --silent `
+            --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -eq 0) { return $true }
+        Warn "winget install returned $LASTEXITCODE."
+    } else {
+        Warn "winget not available on this machine."
+    }
+    # Fallback: download and run the official installer silently.
+    $url = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe"
+    $tmp = Join-Path $env:TEMP "python-3.12.8-amd64.exe"
+    try {
+        Info "Downloading $url ..."
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+        Info "Running the installer (per-user, adds to PATH)..."
+        Start-Process -FilePath $tmp -Wait -ArgumentList `
+            "/quiet", "InstallAllUsers=0", "PrependPath=1", "Include_launcher=1"
+        return $true
+    } catch {
+        Warn "python.org fallback failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 $BasePython = Find-BasePython
 if (-not $BasePython) {
-    Fail "No Python 3.10-3.13 found. Install Python 3.12 from https://www.python.org/downloads/ (tick 'Add to PATH'), then re-run."
+    Warn "No Python 3.10-3.13 found on this machine."
+    $doInstall = $InstallPython
+    if (-not $doInstall) {
+        $ans = Read-Host "Install Python 3.12 automatically now? [Y/n]"
+        $doInstall = ($ans -eq "" -or $ans -match '^(y|yes|o|oui)$')
+    }
+    if ($doInstall) {
+        if (Install-Python312) {
+            $BasePython = Find-BasePython
+        }
+    }
+}
+if (-not $BasePython) {
+    Fail "No usable Python. Install Python 3.12 from https://www.python.org/downloads/ (tick 'Add to PATH'), then re-run."
 }
 $baseVer = (& $BasePython -c "import sys; print('%d.%d.%d' % sys.version_info[:3])").Trim()
 Ok "Using Python $baseVer ($BasePython)"

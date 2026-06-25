@@ -65,10 +65,14 @@ With the Pupil Core bundle already installed and this repo cloned, just run the 
 (double-click **`install.bat`**, or from PowerShell):
 
 ```powershell
-.\install.ps1            # auto: detects the NVIDIA GPU and picks the right torch build
-.\install.ps1 -Cpu       # force the CPU build (laptop without an NVIDIA GPU)
-.\install.ps1 -NoServer  # install only, don't launch the detector at the end
+.\install.ps1                 # auto: detects the NVIDIA GPU and picks the right torch build
+.\install.ps1 -Cpu            # force the CPU build (laptop without an NVIDIA GPU)
+.\install.ps1 -NoServer       # install only, don't launch the detector at the end
+.\install.ps1 -InstallPython  # also auto-install Python 3.12 if none is found
 ```
+
+Any existing **Python 3.10–3.13** works (3.12 is only preferred). If none is found, the installer
+offers to install Python 3.12 for you (via winget, falling back to the python.org installer).
 
 It creates the `.venv`, **detects the GPU** (and warns about a CPU fallback if there's no NVIDIA
 card), installs the dependencies, copies both plugins into `~/pupil_capture_settings/plugins` and
